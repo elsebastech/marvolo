@@ -1,14 +1,18 @@
 # Build output — never committed
 Marvolo.app/
+Marvolo.app*/
 source/Marvolo.app/
 build/
 .build/
 *.o
 *.dSYM
 
-# Captures are the user's handwriting. Local state, never in the repo.
+# Data and credentials — local state, never in the repo
 captures/
 *.ndjson
+.env
+.env.*
+!.env.example
 
 # macOS noise
 .DS_Store

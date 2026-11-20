@@ -223,7 +223,10 @@ process.
 
   
 
-## 4. File map (`marvolo.swift`, ~447 lines)
+## 4. File map (`marvolo.swift`)
+
+Line ranges below are from the original 447-line version and have drifted; §14 adds
+the capture/transcribe layer. Search by section banner (`// ---- name`), not by line.
 
   
 
@@ -711,3 +714,114 @@ once the process quits, the history is gone.
   permitted` + `CAPTURE DISABLED`, both endpoints report `"capture":"error"`.
 - Default path: creates `~/Library/Application Support/Marvolo/captures/` and the
   session file on first run.
+
+---
+
+## 14. Capture, transcription and storage offload (2026-11-20)
+
+Two HUD buttons. `capture` snapshots the current page; `transcribe` turns that page
+into text. Both need a model of the page, which the process did not have before.
+
+### The page document
+
+`Document` keeps `pages -> strokes -> points`, fed from `emit()` (the single point
+every decoded record passes through). `0xA1` appends, `0xA0` ends a stroke, `0xC0`
+ends a stroke and opens a new page. Appending three integers under an `NSLock` is
+cheap enough for the Bluetooth callback thread; rendering and network I/O happen on
+the per-connection HTTP thread instead.
+
+`/ctl?action=clear` now also clears this model. Before, `clear` was browser-only, so
+the next capture would have resurrected strokes the user had just wiped.
+
+**Trap:** the `/ctl` closure is `if action == "connect" { … } else { live.disconnect() }`.
+Passing `"clear"` to it would drop the BLE link. The branch matches actions
+explicitly now; never add an action there without matching it.
+
+### Rendering
+
+`renderPNG` draws the vectors into a Core Graphics bitmap (2400 px wide, white
+background, pressure-mapped width) and encodes it with ImageIO; `renderSVG` emits the
+same geometry as lines. No window, no PencilKit, works mid-stroke.
+
+**Trap:** Core Graphics has its origin bottom-left and the notebook's Y grows
+downward, so the context is flipped once (`translateBy` + `scaleBy(1, -1)`). Without
+that flip the PNG is mirrored vertically — the same class of bug as the canvas.
+
+### Endpoints
+
+    GET /capture     -> {ok, page, dir, strokes, points, text, uploaded, webhook, writeErrors?}
+    GET /transcribe  -> {ok, page, text, ms, saved} | {ok:false, error}
+
+Both are GET so the button and a `curl` do the same thing. `respondJSON` exists so
+every reply has its `Content-Length`; the SSE and `/` paths keep their own writers.
+
+`/transcribe` blocks for the length of the OCR round trip (~1 s observed for a page).
+That is intentional: the connection thread serves one request and the browser button
+shows a busy state.
+
+### Notes, and where storage policy lives
+
+A note is a folder: `page.png`, `page.svg`, `meta.json`, and `page.txt` once
+transcribed. Default path is `<captures>/notes/<stamp>-p<N>`, overridable with
+`MARVOLO_NOTES_DIR`. Capturing twice keeps both snapshots.
+
+If `MARVOLO_WEBHOOK_URL` is set, the same files go out as `multipart/form-data`
+(`meta` JSON field, plus `text`, `page`, `svg`) with an optional Bearer token. n8n
+receives one POST and decides whether the note lands in Drive, a vault, or a
+database. Storage credentials never enter this process — that is why the app does
+not know what Drive is.
+
+### Configuration
+
+Environment first, then `~/.config/marvolo/env` (KEY=VALUE, `#` comments, quotes
+stripped). Startup prints presence only — `config: ocr key set -> api.deepseek.com` —
+so a log can be shared without leaking a key. `.env` and `.env.*` are gitignored
+except `.env.example`, which documents the names and nothing else.
+
+### Why transcription is not on-device: PKStrokeRecognizer is gated
+
+`PKStrokeRecognizer` is real on macOS 27 (33 languages, recognition version 9) and it
+runs headless once two build facts are handled:
+
+1. It only exists in the **Xcode** SDK. The CommandLineTools SDK has no
+   `PKStrokeRecognizer`, and the two toolchains are not interchangeable
+   (CLT ships Swift 6.3, Xcode 27's SDK is built with 6.4). Calling Xcode's `swiftc`
+   directly works; `xcrun` refuses until the Xcode licence is accepted with `sudo`.
+2. `PKDrawing(strokes:)` traps with `CFHash() called with NULL` in
+   `PKReplicaManager _saveStateImmediately` when the process has **no bundle
+   identifier**. Embedding `__info_plist` with a `CFBundleIdentifier` (or running
+   inside the `.app`) fixes it.
+
+With both handled, `recognizedText()` and `indexableContent` still return nil for
+strokes we build ourselves. The system log says why:
+
+    stroke provider visible strokes 0
+    RecognitionTask running for 0 strokes: 0 added strokes
+    Raw session result … Text: 0 (0)
+
+The provider discards every stroke that did not come from a PencilKit session. Tried
+and ruled out: scale 0.02–0.1 with pen 1–4 pt, translation to origin and to an A4
+margin, Y normal and flipped, `preferredLanguages` nil/en+es/es, polling for 6 s,
+`dataRepresentation()` round-trip, a real `.app` bundle launched through
+LaunchServices, `PKStrokePath(controlPoints:creationDate:id:)` with stable UUIDs,
+and the new Bézier route `PKStrokePath(bezierPath:creationDate:pointProvider:)`.
+A two-line synthetic drawing is discarded the same way, so it is not about our data.
+The remote-side error itself is redacted (`Remote Recognition error: <private>`);
+unredacting needs `log config --mode private_data:on` as admin.
+
+Conclusion: on-device recognition needs either an Apple answer or a signed-app test on
+a machine where the Xcode licence is accepted. Until then transcription goes through
+OCR, which is a different engine and does not share this limitation.
+
+### Verified (replay, no hardware, no key)
+
+- `capture` on the rescue capture: 65 strokes / 3,665 points -> note folder with
+  `page.png` (154 KB), `page.svg`, `meta.json`; PNG renders upright and legible.
+- Webhook: fake receiver got `multipart/form-data`, `meta` field intact, and
+  `Authorization: Bearer testtoken`; reply status surfaced in the HTTP response.
+- Webhook unset: `uploaded:false`, note kept local, message says so.
+- `transcribe` without a key: `{"ok":false,"error":"DEEPSEEK_API_KEY is not set …"}`.
+- `clear` then `capture`: `nothing written on this page yet` (the model, not the canvas).
+- `/ctl?action=nonsense`: `ok:false`, link state untouched (still `scanning`).
+- HUD in a real browser: buttons render, capture reports `saved … · local only`,
+  transcribe shows the error in red, buttons re-enable in both cases.

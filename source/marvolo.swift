@@ -10,6 +10,9 @@
 import Foundation
 import CoreBluetooth
 import Darwin
+import CoreGraphics
+import ImageIO
+import UniformTypeIdentifiers
 
 signal(SIGPIPE, SIG_IGN)
 // Line-buffer stdout: without this, print() is block-buffered when stdout is not a TTY
@@ -100,6 +103,444 @@ func record(_ json: String) {
     }
 }
 
+// ---------------------------------------------------------------- configuration
+//
+// Every secret comes from the environment, or from ~/.config/marvolo/env — a file
+// that is never in the repo. Nothing here is printed: only whether a value exists.
+// That is what lets this file be published open-source without a scrub pass.
+//
+//   DEEPSEEK_API_KEY        OCR (transcribe button)
+//   MARVOLO_WEBHOOK_URL     n8n webhook that stores the note (capture button)
+//   MARVOLO_WEBHOOK_TOKEN   optional, sent as "Authorization: Bearer …"
+//   MARVOLO_OCR_ENDPOINT    override the OCR endpoint
+//   MARVOLO_NOTES_DIR       override where note folders are written
+
+func readEnvFile(_ path: String) -> [String: String] {
+    guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return [:] }
+    var out: [String: String] = [:]
+    for raw in text.split(separator: "\n") {
+        let line = raw.trimmingCharacters(in: .whitespaces)
+        if line.isEmpty || line.hasPrefix("#") { continue }
+        guard let eq = line.firstIndex(of: "=") else { continue }
+        let key = String(line[line.startIndex..<eq]).trimmingCharacters(in: .whitespaces)
+        var value = String(line[line.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+        if value.count >= 2,
+           (value.hasPrefix("\"") && value.hasSuffix("\"")) || (value.hasPrefix("'") && value.hasSuffix("'")) {
+            value = String(value.dropFirst().dropLast())
+        }
+        if !key.isEmpty { out[key] = value }
+    }
+    return out
+}
+
+let configPath = NSHomeDirectory() + "/.config/marvolo/env"
+let fileEnv = readEnvFile(configPath)
+
+func cfg(_ name: String) -> String? {
+    if let v = ProcessInfo.processInfo.environment[name], !v.isEmpty { return v }
+    if let v = fileEnv[name], !v.isEmpty { return v }
+    return nil
+}
+
+let ocrEndpoint = cfg("MARVOLO_OCR_ENDPOINT") ?? "https://api.deepseek.com/v1/tools/ocr"
+let ocrKey = cfg("DEEPSEEK_API_KEY")
+let webhookURL = cfg("MARVOLO_WEBHOOK_URL")
+let webhookToken = cfg("MARVOLO_WEBHOOK_TOKEN")
+let notesDirEnv = cfg("MARVOLO_NOTES_DIR")
+
+// Say what is configured, never what it is. A missing key should be visible at
+// startup, not discovered by pressing a button that quietly fails.
+print("config: ocr \(ocrKey == nil ? "NO KEY (transcribe will refuse)" : "key set")"
+      + " -> \(URL(string: ocrEndpoint)?.host ?? ocrEndpoint)")
+print("config: webhook \(webhookURL == nil ? "not set (notes stay local)" : (URL(string: webhookURL!)?.host ?? "set"))")
+
+// ---------------------------------------------------------------- page document
+//
+// Until now the process was a pipe: bytes in, bytes out, no model of what had been
+// written. Capture and transcribe both need the page, so keep one.
+//
+// This is updated from `emit`, which runs on the Bluetooth callback thread. Appending
+// three integers under a lock is nanoseconds; rendering and I/O happen elsewhere, so
+// the rule from the handoff (nothing slow on that thread) still holds.
+
+struct DocPoint { let x: Int; let y: Int; let p: Int }
+
+final class Document {
+    private let lock = NSLock()
+    private var pages: [[[DocPoint]]] = [[]]   // page -> stroke -> points
+    private var cur: [DocPoint] = []
+
+    func ingest(_ type: UInt8, x: Int, y: Int, p: Int) {
+        lock.lock(); defer { lock.unlock() }
+        switch type {
+        case 0xA1:
+            cur.append(DocPoint(x: x, y: y, p: p))
+        case 0xA0:                       // hover ends a stroke but not the page
+            flushLocked()
+        case 0xC0:                       // marker: end stroke AND start a new page
+            flushLocked()
+            pages.append([])
+        default:
+            break
+        }
+    }
+
+    private func flushLocked() {
+        if cur.count > 1 { pages[pages.count - 1].append(cur) }
+        cur = []
+    }
+
+    /// Current page and its strokes, including the one still being written.
+    func snapshot() -> (page: Int, strokes: [[DocPoint]]) {
+        lock.lock(); defer { lock.unlock() }
+        var strokes = pages[pages.count - 1]
+        if cur.count > 1 { strokes.append(cur) }
+        return (pages.count - 1, strokes)
+    }
+
+    var pageCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return pages.count
+    }
+
+    /// The browser's `clear` button now clears here too, so the next capture does not
+    /// resurrect strokes the user just wiped off the screen.
+    func clearCurrentPage() {
+        lock.lock(); defer { lock.unlock() }
+        pages[pages.count - 1] = []
+        cur = []
+    }
+}
+
+let document = Document()
+
+// ---------------------------------------------------------------- rendering
+//
+// The capture is vector, so the PNG is rendered from the points, not screenshotted
+// from a browser: no window needed, no scaling artefacts, and it works while the
+// page is mid-stroke.
+
+struct InkFrame { let x0, y0, x1, y1: Double }
+
+func inkFrame(_ strokes: [[DocPoint]]) -> InkFrame? {
+    var x0 = Double.greatestFiniteMagnitude, y0 = Double.greatestFiniteMagnitude
+    var x1 = -Double.greatestFiniteMagnitude, y1 = -Double.greatestFiniteMagnitude
+    var n = 0
+    for s in strokes { for q in s {
+        x0 = min(x0, Double(q.x)); y0 = min(y0, Double(q.y))
+        x1 = max(x1, Double(q.x)); y1 = max(y1, Double(q.y)); n += 1
+    } }
+    guard n > 0 else { return nil }
+    let padX = max(120.0, (x1 - x0) * 0.06), padY = max(120.0, (y1 - y0) * 0.08)
+    return InkFrame(x0: x0 - padX, y0: y0 - padY, x1: x1 + padX, y1: y1 + padY)
+}
+
+/// Pressure to stroke width in output pixels. The device's own pressure units are
+/// 0…8191; the same curve the on-screen renderer uses, scaled to the output so thin
+/// hairlines stay readable instead of vanishing.
+func penWidth(_ p: Int, scale: Double) -> Double {
+    let base = 0.7 + Double(p) / 1100.0
+    return max(1.4, min(10.0, base * scale * 14.0))
+}
+
+func renderPNG(_ strokes: [[DocPoint]], maxWidth: Int = 2400) -> Data? {
+    guard let f = inkFrame(strokes) else { return nil }
+    let w = f.x1 - f.x0, h = f.y1 - f.y0
+    let scale = min(4.0, Double(maxWidth) / max(1.0, w))
+    let pxW = max(1, Int((w * scale).rounded())), pxH = max(1, Int((h * scale).rounded()))
+
+    guard let ctx = CGContext(data: nil, width: pxW, height: pxH, bitsPerComponent: 8,
+                              bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+    else { return nil }
+    ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+    ctx.fill(CGRect(x: 0, y: 0, width: CGFloat(pxW), height: CGFloat(pxH)))
+    ctx.setStrokeColor(CGColor(red: 0.07, green: 0.06, blue: 0.05, alpha: 1))
+    ctx.setLineCap(.round)
+    ctx.setLineJoin(.round)
+    // Core Graphics puts the origin bottom-left; the notebook's Y grows downward.
+    // Flip once here so the render matches the sheet (and never mirror the text).
+    ctx.translateBy(x: 0, y: CGFloat(pxH))
+    ctx.scaleBy(x: 1, y: -1)
+
+    func tx(_ q: DocPoint) -> CGPoint {
+        CGPoint(x: (Double(q.x) - f.x0) * scale, y: (Double(q.y) - f.y0) * scale)
+    }
+    for s in strokes where s.count > 1 {
+        for i in 1..<s.count {
+            ctx.setLineWidth(CGFloat(penWidth((s[i - 1].p + s[i].p) / 2, scale: scale)))
+            ctx.beginPath()
+            ctx.move(to: tx(s[i - 1]))
+            ctx.addLine(to: tx(s[i]))
+            ctx.strokePath()
+        }
+    }
+    guard let image = ctx.makeImage() else { return nil }
+    let out = NSMutableData()
+    guard let dest = CGImageDestinationCreateWithData(out, UTType.png.identifier as CFString, 1, nil)
+    else { return nil }
+    CGImageDestinationAddImage(dest, image, nil)
+    guard CGImageDestinationFinalize(dest) else { return nil }
+    return out as Data
+}
+
+func renderSVG(_ strokes: [[DocPoint]]) -> String? {
+    guard let f = inkFrame(strokes) else { return nil }
+    let w = Int((f.x1 - f.x0).rounded()), h = Int((f.y1 - f.y0).rounded())
+    var out = """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 \(w) \(h)" width="\(w)" height="\(h)">
+    <rect width="\(w)" height="\(h)" fill="#ffffff"/>
+    <g fill="none" stroke="#15120f" stroke-linecap="round" stroke-linejoin="round">
+
+    """
+    func sx(_ v: Int, _ origin: Double) -> Int { Int((Double(v) - origin).rounded()) }
+    for s in strokes where s.count > 1 {
+        for i in 1..<s.count {
+            let a = s[i - 1], b = s[i]
+            let wpx = String(format: "%.2f", penWidth((a.p + b.p) / 2, scale: 1.0) / 14.0 * 3.0)
+            out += "<line x1=\"\(sx(a.x, f.x0))\" y1=\"\(sx(a.y, f.y0))\" x2=\"\(sx(b.x, f.x0))\" "
+                 + "y2=\"\(sx(b.y, f.y0))\" stroke-width=\"\(wpx)\"/>\n"
+        }
+    }
+    out += "</g>\n</svg>\n"
+    return out
+}
+
+// ---------------------------------------------------------------- http client
+//
+// No dependencies, so URLSession with a semaphore: the calling thread is already a
+// per-connection worker, and every call here is allowed to block for a few seconds.
+
+func httpPost(_ urlString: String, body: Data, contentType: String,
+              headers: [String: String] = [:], timeout: TimeInterval = 90) -> (Int, Data) {
+    guard let url = URL(string: urlString) else { return (-1, Data("malformed url".utf8)) }
+    var req = URLRequest(url: url)
+    req.httpMethod = "POST"
+    req.setValue(contentType, forHTTPHeaderField: "Content-Type")
+    for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+    req.httpBody = body
+    req.timeoutInterval = timeout
+
+    let sem = DispatchSemaphore(value: 0)
+    var status = -1
+    var payload = Data()
+    let task = URLSession.shared.dataTask(with: req) { data, response, error in
+        if let http = response as? HTTPURLResponse { status = http.statusCode }
+        if let e = error { payload = Data("transport error: \(e.localizedDescription)".utf8) }
+        else { payload = data ?? Data() }
+        sem.signal()
+    }
+    task.resume()
+    if sem.wait(timeout: .now() + timeout + 5) == .timedOut {
+        task.cancel()
+        return (-1, Data("timeout after \(Int(timeout))s".utf8))
+    }
+    return (status, payload)
+}
+
+func multipart(boundary: String, fields: [(String, String)],
+               files: [(name: String, filename: String, mime: String, data: Data)]) -> Data {
+    var body = Data()
+    for (name, value) in fields {
+        body.append("--\(boundary)\r\n".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n".data(using: .utf8)!)
+        body.append(value.data(using: .utf8)!)
+        body.append("\r\n".data(using: .utf8)!)
+    }
+    for f in files {
+        body.append("--\(boundary)\r\n".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"\(f.name)\"; filename=\"\(f.filename)\"\r\n"
+            .data(using: .utf8)!)
+        body.append("Content-Type: \(f.mime)\r\n\r\n".data(using: .utf8)!)
+        body.append(f.data)
+        body.append("\r\n".data(using: .utf8)!)
+    }
+    body.append("--\(boundary)--\r\n".data(using: .utf8)!)
+    return body
+}
+
+func randomBoundary() -> String { "marvolo-\(UUID().uuidString)" }
+
+/// DeepSeek's OCR tool: image in, text out, one page per response. Not a chat model,
+/// so nothing is invented around the transcription.
+func ocrText(png: Data) -> (text: String?, error: String?) {
+    guard let key = ocrKey else {
+        return (nil, "DEEPSEEK_API_KEY is not set (environment or ~/.config/marvolo/env)")
+    }
+    let boundary = randomBoundary()
+    let body = multipart(boundary: boundary,
+                         fields: [("purpose", "text_recognition")],
+                         files: [(name: "file", filename: "page.png", mime: "image/png", data: png)])
+    let (status, reply) = httpPost(ocrEndpoint, body: body,
+                                   contentType: "multipart/form-data; boundary=\(boundary)",
+                                   headers: ["Authorization": "Bearer \(key)"])
+    guard (200..<300).contains(status) else {
+        let snippet = String(decoding: reply.prefix(400), as: UTF8.self)
+        return (nil, "OCR failed: HTTP \(status) — \(snippet)")
+    }
+    guard let obj = try? JSONSerialization.jsonObject(with: reply) as? [String: Any],
+          let pages = obj["pages"] as? [[String: Any]] else {
+        return (nil, "OCR replied with an unexpected body: \(String(decoding: reply.prefix(300), as: UTF8.self))")
+    }
+    let text = pages.compactMap { $0["text"] as? String }
+        .joined(separator: "\n")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    return (text.isEmpty ? nil : text, text.isEmpty ? "OCR returned no text for this page" : nil)
+}
+
+// ---------------------------------------------------------------- notes
+//
+// A note is a folder, not a database: page.png, page.svg, meta.json and page.txt.
+// n8n receives the same things and decides where they live long-term, so the Drive or
+// vault credentials never enter this process. Swapping storage later means editing a
+// workflow, not rebuilding the app.
+
+var lastTranscript: String? = nil
+var lastTranscriptPage = -1
+var lastNote: (dir: URL, page: Int)? = nil
+
+func noteStamp() -> String {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.timeZone = .current
+    f.dateFormat = "yyyy-MM-dd'T'HH-mm-ss"
+    return f.string(from: Date())
+}
+
+func notesBaseDir() -> URL {
+    if let dir = notesDirEnv { return URL(fileURLWithPath: dir, isDirectory: true) }
+    return captureDir.appendingPathComponent("notes", isDirectory: true)
+}
+
+/// One folder per capture. Capturing twice keeps both snapshots rather than
+/// overwriting: the page may have grown between them, and that is data.
+func uniqueNoteDir(page: Int) -> URL {
+    let base = notesBaseDir()
+    let stem = "\(noteStamp())-p\(page + 1)"
+    var dir = base.appendingPathComponent(stem, isDirectory: true)
+    var n = 2
+    while FileManager.default.fileExists(atPath: dir.path) {
+        dir = base.appendingPathComponent("\(stem)-\(n)", isDirectory: true)
+        n += 1
+    }
+    return dir
+}
+
+func writeNoteFile(_ url: URL, _ data: Data) -> String? {
+    do { try data.write(to: url); return nil }
+    catch { return "\(url.lastPathComponent): \(error.localizedDescription)" }
+}
+
+/// Snapshot the current page. The page stays open — this is a camera, not a scalpel.
+func capturePage() -> [String: Any] {
+    let snap = document.snapshot()
+    let points = snap.strokes.reduce(0) { $0 + $1.count }
+    guard points > 0, let png = renderPNG(snap.strokes) else {
+        return ["ok": false, "error": "nothing written on this page yet"]
+    }
+
+    let dir = uniqueNoteDir(page: snap.page)
+    do { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
+    catch { return ["ok": false, "error": "cannot create \(dir.path): \(error.localizedDescription)"] }
+
+    var failures: [String] = []
+    if let e = writeNoteFile(dir.appendingPathComponent("page.png"), png) { failures.append(e) }
+    let svg = renderSVG(snap.strokes)
+    if let svg = svg, let e = writeNoteFile(dir.appendingPathComponent("page.svg"), Data(svg.utf8)) {
+        failures.append(e)
+    }
+
+    // A transcription made before the capture belongs to the same note, so the note
+    // travels complete instead of the text arriving later and orphaned.
+    let textHere = (lastTranscriptPage == snap.page) ? lastTranscript : nil
+    if let text = textHere,
+       let e = writeNoteFile(dir.appendingPathComponent("page.txt"), Data(text.utf8)) {
+        failures.append(e)
+    }
+
+    var meta: [String: Any] = [
+        "app": "marvolo",
+        "page": snap.page + 1,
+        "captured": ISO8601DateFormatter().string(from: Date()),
+        "strokes": snap.strokes.count,
+        "points": points,
+        "session": (capturePath as NSString).lastPathComponent,
+        "png": "page.png",
+        "svg": svg == nil ? "" : "page.svg",
+    ]
+    if let text = textHere { meta["text"] = text }
+    if let data = try? JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted, .sortedKeys]),
+       let e = writeNoteFile(dir.appendingPathComponent("meta.json"), data) {
+        failures.append(e)
+    }
+    lastNote = (dir, snap.page)
+
+    var result: [String: Any] = [
+        "ok": true,
+        "page": snap.page + 1,
+        "dir": dir.path,
+        "strokes": snap.strokes.count,
+        "points": points,
+        "text": textHere ?? "",
+    ]
+    if !failures.isEmpty { result["writeErrors"] = failures }
+
+    if let hook = webhookURL {
+        var headers: [String: String] = [:]
+        if let token = webhookToken { headers["Authorization"] = "Bearer \(token)" }
+        let boundary = randomBoundary()
+        var fields: [(String, String)] = []
+        if let data = try? JSONSerialization.data(withJSONObject: meta, options: [.sortedKeys]),
+           let json = String(data: data, encoding: .utf8) {
+            fields.append(("meta", json))
+        }
+        if let text = textHere { fields.append(("text", text)) }
+        var files: [(name: String, filename: String, mime: String, data: Data)] = [
+            (name: "page", filename: "page.png", mime: "image/png", data: png)
+        ]
+        if let svg = svg { files.append((name: "svg", filename: "page.svg", mime: "image/svg+xml", data: Data(svg.utf8))) }
+        let (status, reply) = httpPost(hook,
+                                       body: multipart(boundary: boundary, fields: fields, files: files),
+                                       contentType: "multipart/form-data; boundary=\(boundary)",
+                                       headers: headers, timeout: 60)
+        result["uploaded"] = (200..<300).contains(status)
+        result["webhook"] = ["status": status,
+                             "reply": String(decoding: reply.prefix(300), as: UTF8.self)]
+        print("capture: webhook HTTP \(status)")
+    } else {
+        result["uploaded"] = false
+        result["webhook"] = "MARVOLO_WEBHOOK_URL not set — note kept local"
+    }
+    print("capture: page \(snap.page + 1), \(snap.strokes.count) strokes, \(points) points -> \(dir.path)")
+    return result
+}
+
+func transcribePage() -> [String: Any] {
+    let snap = document.snapshot()
+    guard let png = renderPNG(snap.strokes) else {
+        return ["ok": false, "error": "nothing written on this page yet"]
+    }
+    let started = Date()
+    let (text, error) = ocrText(png: png)
+    let ms = Int(Date().timeIntervalSince(started) * 1000)
+    guard let text = text else {
+        print("transcribe: \(error ?? "failed")")
+        return ["ok": false, "error": error ?? "OCR failed", "ms": ms]
+    }
+    lastTranscript = text
+    lastTranscriptPage = snap.page
+
+    // If this page was already captured, the transcript lands in that note too.
+    var saved = ""
+    if let note = lastNote, note.page == snap.page {
+        let url = note.dir.appendingPathComponent("page.txt")
+        if let e = writeNoteFile(url, Data(text.utf8)) { saved = "error: \(e)" } else { saved = url.path }
+    }
+    print("transcribe: page \(snap.page + 1), \(text.count) chars in \(ms) ms")
+    return ["ok": true, "page": snap.page + 1, "text": text, "ms": ms, "saved": saved]
+}
+
 // ---------------------------------------------------------------- page
 
 let html = #"""
@@ -122,15 +563,30 @@ let html = #"""
   .pill.disconnected{background:#f0f0f0;color:#666;border-color:#dcdcdc}
   .pill.bluetoothOff{background:#fdeaea;color:#8f1f1f;border-color:#f3c9c9}
   button[disabled]{opacity:.5;cursor:default}
+  #msg{font-size:11px;color:#1c6b1c;min-height:1em}
+  #msg.err{color:#8f1f1f;font-weight:600}
+  #panel{display:none;margin-top:6px;max-width:460px;max-height:38vh;overflow:auto;
+         background:#fff;border:1px solid #dcdcdc;border-radius:6px;padding:6px 8px}
+  #panelhead{display:flex;align-items:center;gap:6px;margin-bottom:4px;color:#666}
+  #panelhead button{margin-left:auto}
+  #out{margin:0;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;color:#15120f}
 </style></head>
 <body><canvas id="c"></canvas>
 <div id="hud">
   <span class="dot" id="dot"></span><span id="state">connecting…</span>
   <span id="link" class="pill">connecting…</span>
   <button id="linkbtn" onclick="toggleLink()">disconnect</button>
+  <button id="capbtn" onclick="doCapture()">capture</button>
+  <button id="trbtn" onclick="doTranscribe()">transcribe</button>
   <button onclick="clearAll()">clear</button>
   <div>points <b id="pts">0</b> &nbsp; strokes <b id="strokes">0</b> &nbsp; <b id="rate">0</b>/s
        &nbsp;·&nbsp; <span id="cap">checking save…</span></div>
+  <div id="msg"></div>
+  <div id="panel">
+    <div id="panelhead"><b id="eng"></b><button onclick="copyText()">copy</button>
+      <button onclick="hidePanel()">×</button></div>
+    <pre id="out"></pre>
+  </div>
 </div>
 <script>
 const LW = 28800, LH = 36400;          // nominal active area only; Y grows DOWNWARD (origin top-left)
@@ -200,7 +656,54 @@ function ingest(m){
 }
 function clearAll(){
   strokes = []; cur = []; hovers = []; pts = 0; marks = 0; dirty = true; redraw(); paint();
+  // Clear the server-side page too, otherwise the next capture would resurrect what
+  // the user just wiped off the screen.
+  fetch('/ctl?action=clear').catch(()=>{});
 }
+
+// Snapshot and transcription. Both block on the server, so the buttons say what they
+// are doing and refuse a second click while one is in flight.
+let lastText = '';
+function say(text, bad){
+  const el = document.getElementById('msg');
+  el.textContent = text;
+  el.className = bad ? 'err' : '';
+  if (!bad) { const mine = text; setTimeout(() => { if (el.textContent === mine) el.textContent = ''; }, 6000); }
+}
+async function doCapture(){
+  const b = document.getElementById('capbtn');
+  b.disabled = true; say('capturing…');
+  try {
+    const r = await (await fetch('/capture')).json();
+    if (!r.ok) { say(r.error || 'capture failed', true); }
+    else {
+      const name = (r.dir || '').split('/').pop();
+      say('saved ' + name + (r.uploaded ? ' · sent' : ' · local only'));
+    }
+  } catch (e) { say('capture failed: ' + e, true); }
+  b.disabled = false;
+}
+async function doTranscribe(){
+  const b = document.getElementById('trbtn');
+  b.disabled = true; say('transcribing…');
+  try {
+    const r = await (await fetch('/transcribe')).json();
+    if (!r.ok) { say(r.error || 'transcription failed', true); }
+    else {
+      lastText = r.text || '';
+      document.getElementById('out').textContent = lastText;
+      document.getElementById('eng').textContent = 'ocr ' + (r.ms / 1000).toFixed(1) + 's'
+        + (r.saved ? ' · saved' : '');
+      document.getElementById('panel').style.display = 'block';
+      say('transcribed');
+    }
+  } catch (e) { say('transcription failed: ' + e, true); }
+  b.disabled = false;
+}
+function copyText(){
+  navigator.clipboard.writeText(lastText).then(() => say('copied')).catch(() => say('copy failed', true));
+}
+function hidePanel(){ document.getElementById('panel').style.display = 'none'; }
 let linkEnabled = true, linkBusy = false;
 
 function applyStatus(m){
@@ -395,19 +898,39 @@ final class Server {
             return
         }
 
-        // Control endpoint for connect/disconnect from the browser HUD.
-        //   GET /ctl?action=connect
-        //   GET /ctl?action=disconnect
+        // Control endpoint for the browser HUD.
+        //   GET /ctl?action=connect | disconnect | clear
+        // `clear` is deliberately NOT forwarded to the BLE layer: that closure treats
+        // anything that is not "connect" as disconnect, which would drop the link.
         if path.hasPrefix("/ctl") {
             let action = path.contains("action=connect") ? "connect"
-                      : path.contains("action=disconnect") ? "disconnect" : ""
-            if !action.isEmpty { linkControl?(action) }
-            let body = Array("{\"ok\":\(action.isEmpty ? "false" : "true")}".utf8)
-            var head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-            head += "Content-Length: \(body.count)\r\nConnection: close\r\n\r\n"
-            _ = sendAll(fd, Array(head.utf8))
-            _ = sendAll(fd, body)
-            close(fd)
+                      : path.contains("action=disconnect") ? "disconnect"
+                      : path.contains("action=clear") ? "clear" : ""
+            var ok = false
+            switch action {
+            case "connect", "disconnect":
+                linkControl?(action); ok = true
+            case "clear":
+                document.clearCurrentPage(); ok = true
+            default:
+                break
+            }
+            _ = respondJSON(fd, ["ok": ok, "action": action])
+            return
+        }
+
+        // Snapshot the current page: renders it, writes the note folder, and hands the
+        // same files to the n8n webhook if one is configured. GET so that both the HUD
+        // button and a plain curl call do the same thing.
+        if path.hasPrefix("/capture") {
+            _ = respondJSON(fd, capturePage())
+            return
+        }
+
+        // Transcribe the current page through the OCR endpoint. Blocking by design: the
+        // browser button waits and shows the result, and this thread serves one request.
+        if path.hasPrefix("/transcribe") {
+            _ = respondJSON(fd, transcribePage())
             return
         }
 
@@ -426,6 +949,20 @@ final class Server {
 
         _ = sendAll(fd, Array("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8))
         close(fd)
+    }
+
+    /// One JSON reply, headers and all. Every endpoint that is not the SSE stream or
+    /// the page itself goes through here, so Content-Length is never forgotten.
+    @discardableResult
+    private func respondJSON(_ fd: Int32, _ object: [String: Any]) -> Bool {
+        let body = (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]))
+            ?? Data("{\"ok\":false,\"error\":\"could not encode response\"}".utf8)
+        var head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        head += "Content-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+        _ = sendAll(fd, Array(head.utf8))
+        _ = sendAll(fd, [UInt8](body))
+        close(fd)
+        return true
     }
 
     private func sendAll(_ fd: Int32, _ bytes: [UInt8]) -> Bool {
@@ -499,6 +1036,7 @@ Thread.detachNewThread {
 // ---------------------------------------------------------------- ink decoding
 
 func emit(type: UInt8, x: Int, y: Int, p: Int) {
+    document.ingest(type, x: x, y: y, p: p)
     switch type {
     case 0xA1: server.broadcast("{\"t\":\"ink\",\"x\":\(x),\"y\":\(y),\"p\":\(p)}")
     case 0xA0: server.broadcast("{\"t\":\"hover\",\"x\":\(x),\"y\":\(y)}")

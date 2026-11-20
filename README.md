@@ -15,14 +15,20 @@ One Swift file, no package dependencies: `swiftc` and the system frameworks.
 - Pressure-based stroke width, hover trail, auto-fit framing, backlog catch-up on reload.
 - Connect / disconnect the notebook on demand from the HUD.
 - Every event is appended to an ndjson session file on disk (see below).
+- **Capture**: one click renders the current page to PNG + SVG, writes a note folder,
+  and POSTs it to an n8n webhook if one is configured.
+- **Transcribe**: one click sends that PNG to on-demand OCR and shows the text in the
+  HUD, ready to copy.
 
 ## What does not work yet
 
 - **Offline pages are unreachable.** The device stores ~50 pages written while
   disconnected; pulling them needs a vendor command on `2B11` that has not been
   reverse-engineered. PacketLogger is a dead end on macOS 27.
-- **No transcription.** The intended route is PencilKit's `PKStrokeRecognizer`
-  (on-device, macOS 27) fed with strokes rebuilt from the archive.
+- **No on-device transcription.** `PKStrokeRecognizer` exists on macOS 27 and is
+  wired up to work, but it treats programmatically built strokes as invisible
+  ("stroke provider visible strokes 0") and returns nil, so transcription goes
+  through an OCR API instead. See ASSISTANT-HANDOFF.md §14.
 - Settings / firmware info (sleep timeout, BLE name, MAC) are not implemented.
 
 ## Layout
@@ -51,6 +57,43 @@ level up. Forgetting the `mv` silently ships the previous build. Verify:
 
 First launch needs Bluetooth permission, and the app is ad-hoc signed, so use
 right-click → Open or `xattr -dr com.apple.quarantine Marvolo.app`.
+
+## Capture and transcription
+
+Two buttons in the HUD, two endpoints, all secrets from the environment.
+
+    GET /capture      snapshot the current page -> note folder, optional webhook POST
+    GET /transcribe   OCR the current page      -> text, saved next to the note
+    GET /ctl?action=clear   also clears the server's copy of the page
+
+A note is a folder, not a database:
+
+    ~/Library/Application Support/Marvolo/captures/notes/2026-11-20T13-14-28-p1/
+        page.png     the page, rendered from the vectors at 2400 px wide
+        page.svg     same page, vector
+        meta.json    page, captured, strokes, points, session file, text (if any)
+        page.txt     transcript, present once you transcribe that page
+
+Capturing does **not** close the page: it is a camera, not a scalpel. Capturing
+twice keeps both snapshots. Transcribing before capturing is fine — the text
+travels with the note.
+
+Configuration (environment first, then `~/.config/marvolo/env`; see `.env.example`):
+
+    DEEPSEEK_API_KEY        OCR key. Without it the transcribe button says so.
+    MARVOLO_WEBHOOK_URL     where notes go; empty means local only
+    MARVOLO_WEBHOOK_TOKEN   optional, sent as "Authorization: Bearer …"
+    MARVOLO_OCR_ENDPOINT    default https://api.deepseek.com/v1/tools/ocr
+    MARVOLO_NOTES_DIR       default <captures>/notes
+
+The webhook receives `multipart/form-data`: a `meta` field (JSON) and, when they
+exist, `text`, `page` (page.png) and `svg`. That is the whole contract, so storage
+policy (Drive, a vault, a database) lives in n8n, not in this process.
+
+The app prints what is configured at startup, never the values:
+
+    config: ocr key set -> api.deepseek.com
+    config: webhook 127.0.0.1
 
 ## Where strokes are stored
 
