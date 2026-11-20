@@ -854,3 +854,10 @@ note that silently comes from an older file would be a lie about its provenance.
 
 Verified with the real session: `capture` returned `source: session-file`, 20 strokes,
 1,279 points, and the rendered page reads "Punto de partida", upright and legible.
+
+Known quirk of the fallback: it only applies while memory is empty. Once ink arrives
+in a restarted process, the sheet is that new ink alone — earlier strokes are still in
+the previous session file, never rewritten, but they are not part of the new sheet. If
+that matters for a workflow, seed the document at startup instead of lazily; the
+reason it is not done today is that seeding would resurrect yesterday's note for
+someone starting a clean sheet.

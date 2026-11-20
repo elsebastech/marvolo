@@ -82,7 +82,9 @@ A sheet is bounded by `clear` only. The notebook's `0xC0` marker is a stroke
 break, not a page turn — it fires mid-writing, so treating it as a page change
 left capture staring at an empty page. If the app has just restarted, capture
 rebuilds the strokes from the newest session file that has ink and says so in
-`meta.json` (`"source": "session-file"`).
+`meta.json` (`"source": "session-file"`). Once new ink arrives in that restarted
+process, the sheet is only the new ink: everything older stays in the session
+files, which are never rewritten.
 
 Configuration (environment first, then `~/.config/marvolo/env`; see `.env.example`):
 
