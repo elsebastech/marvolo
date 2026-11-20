@@ -972,3 +972,86 @@ Missing key still answers `DEEPSEEK_API_KEY is not set (environment or
    outcome: that file is the user's credentials, not a scratch pad. Use environment
    variables plus a `MARVOLO_OCR_ENDPOINT` stand-in instead, and assert the request shape
    rather than the key.
+
+---
+
+## 17. Transcription: two engines, and what the request actually is (2026-11-20)
+
+The first real transcripts came back with wrong words: "Nueva nota de **Prenda**" and
+"**Prova** de nota" for what the page plainly says ("Prueba"). The fix was not a bigger
+image; it was changing what is sent.
+
+### What the app sends
+
+`vision` (default) — `POST https://api.deepseek.com/chat/completions`:
+
+    model: deepseek-flash, temperature 0, max_tokens 4096
+    messages[0].content = [
+      {type: text,      text: <transcribe literally, keep accents, do not correct>},
+      {type: image_url, image_url: {url: data:image/png;base64,…, detail: "original"}}
+    ]
+
+`ocr` (`MARVOLO_OCR_MODE=ocr`) — `POST https://api.deepseek.com/v1/tools/ocr`,
+`multipart/form-data` with exactly two fields, `file` and `purpose=text_recognition`.
+
+### Why the OCR endpoint loses
+
+Its API takes **no prompt**: the docs say any field other than `file` and `purpose` is a
+400. So it cannot be told that the page is Spanish, or that it should not correct. It
+reads glyphs. The device writes `b` as a delta, and with no language prior "Prueba"
+becomes "Prenda" or "Prova". Measured, same page, same day:
+
+| variant | input tokens | result |
+|---|---|---|
+| OCR, full page | 621 | "Nueva nota de **Prenda**" |
+| OCR, page cut into ink bands | ~200/band | "Nueva nota de **Preeba**" (and it dropped the second line) |
+| OCR, single line crop | 153 | "Nueva nota de **Preeba**" |
+| OCR, line crop at 1.5× | 153 | identical — upscaling adds nothing |
+| OCR, binarized (threshold 150) | 153 | empty |
+| vision model, `detail: original` | 1,086 | "Nueva **Nota** de **Prueba**" |
+| vision model, `detail: low` | 298 | "Nueva nota de **Prueba**" |
+
+So the difference from the assistant reading the same PNG is not "the assistant cheated":
+the assistant is a vision model with an instruction, and the OCR endpoint structurally
+cannot be given one. Cropping to lines recovers detail (621 → 153 tokens, "Prenda" →
+"Preeba") but does not resolve the glyph; the language prior does.
+
+Interesting and worth keeping: `detail: low` (512×512) still read the word correctly and
+cost a quarter of the tokens. It is not the default because a page with several lines
+squeezed into 512×512 loses lines, which is exactly what the band experiment showed.
+
+### The trap: `finish_reason: "length"` with empty content
+
+The vision model is a reasoning model. On some pages it spends the entire `max_tokens`
+budget thinking (`completion_tokens_details.reasoning_tokens` == the cap) and returns
+`content: ""` with `finish_reason: "length"`. First version reported "the model returned
+no text for this page" and the note failed. Observed once in three notes, and
+non-deterministic: a later call on the same page succeeded at 3.5 s.
+
+`visionText()` now retries once with `max_tokens: 8192` and a shorter instruction, and
+says so in the log. Chosen over "raise the cap and hope": the retry also bounds the
+worst case, and the shorter prompt measurably reduces deliberation.
+
+### Cost and latency (measured here)
+
+- vision: 3–5 s typical, 17.8 s worst observed (one note deliberated hard); 1,086 prompt
+  + ~500 completion tokens, ~900 of them cached on repeat calls.
+- ocr: ~3 s, billed $0.225 per 1,000 pages.
+
+### Inventory of the request path in code
+
+`transcribePage()` (HUD) and `transcribeNote()` (`/note/transcribe?d=`) both call
+`transcribeImage(png:)`, which dispatches on `MARVOLO_OCR_MODE` to `visionText()` or
+`ocrText()`. Both return `(text, error, engine)`; `attachTranscript()` writes `page.txt`
+and merges `text`, `transcribed` and `engine` into `meta.json`.
+
+`ocrText()` also gained: detection of the `error` object (the service can return one with
+a 200), a warning when `finish_reason` is `length` (truncated page), and
+`cleanRecognizedText()` to strip the layout tokens (`<｜ref｜>…<｜/ref｜>`,
+`<｜box｜>[[x1, y1, x2, y2]]<｜/box｜>`) the endpoint puts inside `text`.
+
+### Verified
+
+Re-transcribed three real notes through the app: "Prueba de nota 20 Nov 2026 /
+Continuando Prueba", "Nueva Nota de Prueba / Cool stuff!", "Probando probando 1,2,3" —
+all with `engine: "vision:deepseek-flash"` recorded in `meta.json`.

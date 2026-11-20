@@ -143,6 +143,9 @@ func cfg(_ name: String) -> String? {
 }
 
 let ocrEndpoint = cfg("MARVOLO_OCR_ENDPOINT") ?? "https://api.deepseek.com/v1/tools/ocr"
+let chatEndpoint = cfg("MARVOLO_CHAT_ENDPOINT") ?? "https://api.deepseek.com/chat/completions"
+let visionModel = cfg("MARVOLO_OCR_MODEL") ?? "deepseek-flash"
+let ocrMode = cfg("MARVOLO_OCR_MODE") ?? "vision"
 let ocrKey = cfg("DEEPSEEK_API_KEY")
 let webhookURL = cfg("MARVOLO_WEBHOOK_URL")
 let webhookToken = cfg("MARVOLO_WEBHOOK_TOKEN")
@@ -150,8 +153,13 @@ let notesDirEnv = cfg("MARVOLO_NOTES_DIR")
 
 // Say what is configured, never what it is. A missing key should be visible at
 // startup, not discovered by pressing a button that quietly fails.
-print("config: ocr \(ocrKey == nil ? "NO KEY (transcribe will refuse)" : "key set")"
-      + " -> \(URL(string: ocrEndpoint)?.host ?? ocrEndpoint)")
+if ocrMode == "ocr" {
+    print("config: transcribe \(ocrKey == nil ? "NO KEY (will refuse)" : "key set")"
+          + " -> ocr endpoint \(URL(string: ocrEndpoint)?.host ?? ocrEndpoint)")
+} else {
+    print("config: transcribe \(ocrKey == nil ? "NO KEY (will refuse)" : "key set")"
+          + " -> \(visionModel) at \(URL(string: chatEndpoint)?.host ?? chatEndpoint)")
+}
 print("config: webhook \(webhookURL == nil ? "not set (notes stay local)" : (URL(string: webhookURL!)?.host ?? "set"))")
 
 // ---------------------------------------------------------------- page document
@@ -396,14 +404,129 @@ func ocrText(png: Data) -> (text: String?, error: String?) {
         let snippet = String(decoding: reply.prefix(400), as: UTF8.self)
         return (nil, "OCR failed: HTTP \(status) — \(snippet)")
     }
-    guard let obj = try? JSONSerialization.jsonObject(with: reply) as? [String: Any],
-          let pages = obj["pages"] as? [[String: Any]] else {
+    guard let obj = try? JSONSerialization.jsonObject(with: reply) as? [String: Any] else {
         return (nil, "OCR replied with an unexpected body: \(String(decoding: reply.prefix(300), as: UTF8.self))")
     }
-    let text = pages.compactMap { $0["text"] as? String }
-        .joined(separator: "\n")
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-    return (text.isEmpty ? nil : text, text.isEmpty ? "OCR returned no text for this page" : nil)
+    // The service reports a failure as an error object, sometimes with a 200 status.
+    if let err = obj["error"] as? [String: Any], let message = err["message"] as? String {
+        return (nil, "OCR failed: \(message)")
+    }
+    guard let pages = obj["pages"] as? [[String: Any]] else {
+        return (nil, "OCR replied with an unexpected body: \(String(decoding: reply.prefix(300), as: UTF8.self))")
+    }
+    let truncated = pages.contains { ($0["finish_reason"] as? String) == "length" }
+    let joined = pages.compactMap { $0["text"] as? String }.joined(separator: "\n")
+    let text = cleanRecognizedText(joined)
+    if text.isEmpty { return (nil, "OCR returned no text for this page") }
+    return (truncated ? text + "\n[transcripción truncada: el OCR llegó a su límite]" : text, nil)
+}
+
+/// The OCR service keeps its layout tokens in `text` (`<｜ref｜>…<｜/ref｜>` plus
+/// `[[x1, y1, x2, y2]]` boxes). A transcript for a human should not carry them.
+func cleanRecognizedText(_ raw: String) -> String {
+    var text = raw
+    for pattern in ["<｜/?[^｜]+｜>", "\\[\\[[0-9,\\s]*\\]\\]"] {
+        if let regex = try? NSRegularExpression(pattern: pattern) {
+            let range = NSRange(text.startIndex..., in: text)
+            text = regex.stringByReplacingMatches(in: text, range: range, withTemplate: "")
+        }
+    }
+    return text.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+/// What we ask the vision model. The OCR endpoint cannot take a prompt at all, which is
+/// why it reads glyphs and not words: "Prueba" comes back as "Prenda" because the delta
+/// shape of the b is all it has to go on.
+let transcriptPrompt = """
+Transcribe literalmente el texto manuscrito de esta imagen, línea por línea, en el orden \
+en que aparece. Respeta acentos, mayúsculas y puntuación. No corrijas ni interpretes: si \
+una palabra es dudosa, escríbela como la ves. Devuelve solo la transcripción, sin comentarios.
+"""
+
+/// A shorter instruction for the retry, when the long one led the model into a long
+/// internal deliberation that ate the whole token budget.
+let shortTranscriptPrompt = "Transcribe literalmente el texto manuscrito de esta imagen. Devuelve solo la transcripción."
+
+func visionOnce(png: Data, maxTokens: Int, prompt: String) -> (text: String, finish: String, error: String?) {
+    guard let key = ocrKey else {
+        return ("", "", "DEEPSEEK_API_KEY is not set (environment or ~/.config/marvolo/env)")
+    }
+    let payload: [String: Any] = [
+        "model": visionModel,
+        "temperature": 0,
+        "max_tokens": maxTokens,
+        "messages": [[
+            "role": "user",
+            "content": [
+                ["type": "text", "text": prompt],
+                ["type": "image_url", "image_url": [
+                    "url": "data:image/png;base64," + png.base64EncodedString(),
+                    "detail": "original",
+                ]],
+            ],
+        ]],
+    ]
+    guard let body = try? JSONSerialization.data(withJSONObject: payload) else {
+        return ("", "", "could not build the transcription request")
+    }
+    let (status, reply) = httpPost(chatEndpoint, body: body, contentType: "application/json",
+                                   headers: ["Authorization": "Bearer \(key)"], timeout: 120)
+    guard (200..<300).contains(status) else {
+        return ("", "", "transcription failed: HTTP \(status) — \(String(decoding: reply.prefix(400), as: UTF8.self))")
+    }
+    guard let obj = try? JSONSerialization.jsonObject(with: reply) as? [String: Any] else {
+        return ("", "", "transcription replied with an unexpected body: \(String(decoding: reply.prefix(300), as: UTF8.self))")
+    }
+    if let err = obj["error"] as? [String: Any], let message = err["message"] as? String {
+        return ("", "", "transcription failed: \(message)")
+    }
+    guard let choices = obj["choices"] as? [[String: Any]],
+          let message = choices.first?["message"] as? [String: Any] else {
+        return ("", "", "transcription returned no choice: \(String(decoding: reply.prefix(300), as: UTF8.self))")
+    }
+    let content = message["content"] as? String ?? ""
+    let finish = choices.first?["finish_reason"] as? String ?? ""
+    return (content, finish, nil)
+}
+
+func visionText(png: Data) -> (text: String?, error: String?) {
+    var attempt = visionOnce(png: png, maxTokens: 4096, prompt: transcriptPrompt)
+    if attempt.error == nil && (attempt.finish == "length" || attempt.text.isEmpty) {
+        // Reasoning models sometimes spend the entire budget thinking and emit nothing:
+        // finish_reason comes back "length" with an empty message. One retry with more
+        // room and a shorter instruction is cheaper than failing the note.
+        print("transcribe: retrying with a bigger budget (finish was \(attempt.finish))")
+        attempt = visionOnce(png: png, maxTokens: 8192, prompt: shortTranscriptPrompt)
+    }
+    if let error = attempt.error { return (nil, error) }
+    let text = stripFence(attempt.text)
+    if text.isEmpty {
+        return (nil, "the model used its budget on reasoning and returned no text (finish: \(attempt.finish))")
+    }
+    return (text, nil)
+}
+
+/// Models wrap answers in a code fence even when told not to.
+func stripFence(_ raw: String) -> String {
+    var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if text.hasPrefix("```"), let firstBreak = text.firstIndex(of: "\n") {
+        text = String(text[text.index(after: firstBreak)...])
+        if let fence = text.range(of: "```", options: .backwards) {
+            text = String(text[text.startIndex..<fence.lowerBound])
+        }
+    }
+    return text.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+/// One entry point, two engines. `MARVOLO_OCR_MODE=ocr` keeps the document recognizer;
+/// the default is the vision model because it reads words, not just glyphs.
+func transcribeImage(png: Data) -> (text: String?, error: String?, engine: String) {
+    if ocrMode == "ocr" {
+        let (text, error) = ocrText(png: png)
+        return (text, error, "ocr")
+    }
+    let (text, error) = visionText(png: png)
+    return (text, error, "vision:\(visionModel)")
 }
 
 // ---------------------------------------------------------------- notes
@@ -601,13 +724,14 @@ func strokesFromDisk() -> (strokes: [[DocPoint]], file: String) {
 /// Write a transcript into a note folder and record it in meta.json. The HUD's
 /// transcribe and the library's must leave the note in exactly the same shape, so both
 /// go through here instead of each writing its own file.
-func attachTranscript(noteDir: URL, text: String) -> String? {
+func attachTranscript(noteDir: URL, text: String, engine: String = "") -> String? {
     if let e = writeNoteFile(noteDir.appendingPathComponent("page.txt"), Data(text.utf8)) { return e }
     let metaURL = noteDir.appendingPathComponent("meta.json")
     if let data = try? Data(contentsOf: metaURL),
        var meta = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
         meta["text"] = text
         meta["transcribed"] = ISO8601DateFormatter().string(from: Date())
+        if !engine.isEmpty { meta["engine"] = engine }
         if let out = try? JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted, .sortedKeys]),
            let e = writeNoteFile(metaURL, out) {
             return e
@@ -723,11 +847,11 @@ func transcribePage() -> [String: Any] {
                     : "no ink yet — nothing has been written"]
     }
     let started = Date()
-    let (text, error) = ocrText(png: png)
+    let (text, error, engine) = transcribeImage(png: png)
     let ms = Int(Date().timeIntervalSince(started) * 1000)
     guard let text = text else {
         print("transcribe: \(error ?? "failed")")
-        return ["ok": false, "error": error ?? "OCR failed", "ms": ms]
+        return ["ok": false, "error": error ?? "transcription failed", "ms": ms]
     }
     lastTranscript = text
     lastTranscriptPage = snap.page
@@ -735,31 +859,31 @@ func transcribePage() -> [String: Any] {
     // If this page was already captured, the transcript lands in that note too.
     var saved = ""
     if let note = lastNote, note.page == snap.page {
-        if let e = attachTranscript(noteDir: note.dir, text: text) { saved = "error: \(e)" }
+        if let e = attachTranscript(noteDir: note.dir, text: text, engine: engine) { saved = "error: \(e)" }
         else { saved = note.dir.appendingPathComponent("page.txt").path }
     }
-    print("transcribe: page \(snap.page + 1), \(text.count) chars in \(ms) ms")
-    return ["ok": true, "page": snap.page + 1, "text": text, "ms": ms, "saved": saved]
+    print("transcribe: page \(snap.page + 1), \(text.count) chars in \(ms) ms (\(engine))")
+    return ["ok": true, "page": snap.page + 1, "text": text, "ms": ms, "saved": saved, "engine": engine]
 }
 
-/// Transcribe a note that already exists, from the library. Same OCR path, but the
-/// image comes off disk and the result is written back into that note.
+/// Transcribe a note that already exists, from the library. Same engine, but the image
+/// comes off disk and the result is written back into that note.
 func transcribeNote(_ dirName: String) -> [String: Any] {
     guard let pngURL = noteFile(dirName, "page.png"), let png = try? Data(contentsOf: pngURL) else {
         return ["ok": false, "error": "that note has no page.png to transcribe"]
     }
     let started = Date()
-    let (text, error) = ocrText(png: png)
+    let (text, error, engine) = transcribeImage(png: png)
     let ms = Int(Date().timeIntervalSince(started) * 1000)
     guard let text = text else {
         print("transcribe note \(dirName): \(error ?? "failed")")
-        return ["ok": false, "error": error ?? "OCR failed", "ms": ms]
+        return ["ok": false, "error": error ?? "transcription failed", "ms": ms]
     }
-    if let e = attachTranscript(noteDir: pngURL.deletingLastPathComponent(), text: text) {
+    if let e = attachTranscript(noteDir: pngURL.deletingLastPathComponent(), text: text, engine: engine) {
         return ["ok": false, "error": "could not write the note: \(e)", "text": text, "ms": ms]
     }
-    print("transcribe note \(dirName): \(text.count) chars in \(ms) ms")
-    return ["ok": true, "id": dirName, "text": text, "ms": ms]
+    print("transcribe note \(dirName): \(text.count) chars in \(ms) ms (\(engine))")
+    return ["ok": true, "id": dirName, "text": text, "ms": ms, "engine": engine]
 }
 
 // ---------------------------------------------------------------- page

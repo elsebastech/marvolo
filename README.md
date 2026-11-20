@@ -100,8 +100,35 @@ policy (Drive, a vault, a database) lives in n8n, not in this process.
 
 The app prints what is configured at startup, never the values:
 
-    config: ocr key set -> api.deepseek.com
+    config: transcribe key set -> deepseek-flash at api.deepseek.com
     config: webhook 127.0.0.1
+
+## How transcription reads a page
+
+Two engines, one entry point (`MARVOLO_OCR_MODE`):
+
+| | `vision` (default) | `ocr` |
+|---|---|---|
+| Request | `POST /chat/completions`, model `deepseek-flash`, image as a base64 `data:` URL with `detail: original`, plus an instruction to transcribe literally | `POST /v1/tools/ocr`, `multipart` with `file` and `purpose=text_recognition` |
+| Takes a prompt | yes | no — the docs reject any field other than `file` and `purpose` |
+| Reads | words, in the context of the language | glyphs |
+| Measured | "Nueva nota de **Prueba**" | "Nueva nota de **Prenda**" |
+| Latency | 3–5 s, up to ~18 s when the model deliberates | ~3 s |
+
+The default is `vision` because the document recognizer misreads ambiguous letters: on
+the same page it returned "Prenda" and "Prova" for "Prueba". With the vision model the
+page is 1,086 prompt tokens; the OCR endpoint compresses the whole sheet into 621 input
+tokens, which is why detail is lost.
+
+Both engines write through `attachTranscript()`, which records `engine` in `meta.json`
+so a note always says how its text was produced. Set `MARVOLO_OCR_MODE=ocr` to use the
+document recognizer (cheaper, no instruction, worse on handwriting).
+
+Tooling for comparing them lives in `tools/`:
+
+    python3 tools/transcribe-variants.py <note dir>   # full page vs ink bands
+    python3 tools/ocr-probe.py <note dir>             # lines, 1.5x, threshold
+    python3 tools/transcribe-vlm.py <note dir>        # vision model with an instruction
 
 ## Library
 
