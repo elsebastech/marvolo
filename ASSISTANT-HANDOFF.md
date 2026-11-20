@@ -920,3 +920,55 @@ different feature with different rules about which file becomes the truth.
   (`15020×12203`, 1,966 line elements), wheel zoom changes the transform
   (0.0244 → 0.1646 → 2.27), `fit` restores the framed view, `Esc` closes.
 - Thumbnails: 360×292 / 360×157 / 360×49 depending on the note's aspect, ~9–15 KB each.
+
+---
+
+## 16. Transcribing notes that already exist (2026-11-20)
+
+The library got a `transcribe` action, and both transcription paths now leave a note in
+the same shape.
+
+### One writer for transcripts
+
+`attachTranscript(noteDir:text:)` writes `page.txt` **and** merges `text` plus a
+`transcribed` ISO 8601 timestamp into `meta.json`. It is used by:
+
+- `transcribePage()` — the HUD button, when the sheet was already captured
+  (`lastNote`), and
+- `transcribeNote(_:)` — `GET /note/transcribe?d=<note id>`, which OCRs the note's own
+  `page.png` off disk and writes back into that folder.
+
+Before this, the HUD path wrote only `page.txt`, so `meta.json` and the library badge
+disagreed with the folder. Anything that consumes notes (n8n included) should trust
+`meta.json`, so it has to be true.
+
+The library button is disabled when `hasText` is already true; `/notes` reports
+`hasText` and, when present, `text`.
+
+### Verified without a real key
+
+A local stand-in for `/v1/tools/ocr` (answers the same JSON shape, records what it
+receives) plus `DEEPSEEK_API_KEY` + `MARVOLO_OCR_ENDPOINT` in the process environment
+was enough to exercise the whole chain:
+
+- request was `multipart/form-data` with the PNG present (`has_png_magic: true`), a
+  `purpose` field, and `Authorization: Bearer …`;
+- response parsed, `{"ok":true,"id":…,"ms":53,"text":"probando probando 1,2,3\n— firma"}`;
+- `page.txt` written, `meta.json` gained `text` and `transcribed`;
+- `/notes` flipped that note to `hasText: true` and later returned its `text`.
+
+Missing key still answers `DEEPSEEK_API_KEY is not set (environment or
+~/.config/marvolo/env)` — the message names the file so the fix is obvious.
+
+### Two traps about testing the config file
+
+1. **`NSHomeDirectory()` ignores `HOME`.** Launching the binary with
+   `HOME=/tmp/fakehome` does *not* redirect `~/.config/marvolo/env` or
+   Application Support: both still resolve to the real home, so a sandboxed config test
+   is impossible that way. Testing the file reader requires either the real file or a
+   `MARVOLO_*` override.
+2. **Never write test keys into the user's config file.** An attempt to drop a fake key
+   into `~/.config/marvolo/env` was blocked by the approval guard, which is the correct
+   outcome: that file is the user's credentials, not a scratch pad. Use environment
+   variables plus a `MARVOLO_OCR_ENDPOINT` stand-in instead, and assert the request shape
+   rather than the key.

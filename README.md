@@ -120,8 +120,16 @@ the notes directory and anything that is not one of the four files it wrote itse
 Thumbnails are cached as `thumb.png` next to each note and regenerated only when the
 page PNG is newer, so a large archive still opens instantly.
 
-Today the note actions are `open in Finder` and `copy text` (enabled only when the
-note has a transcript).
+Today the note actions are `open in Finder`, `copy text` (enabled only when the note
+has a transcript) and `transcribe`, which OCRs that note's own `page.png` and writes
+the result back into the same folder:
+
+    GET /note/transcribe?d=<note id>   -> { ok, id, text, ms } | { ok:false, error }
+
+Transcribing a note writes `page.txt` **and** updates `meta.json` with `text` and a
+`transcribed` timestamp, so the library, the note on disk and any webhook consumer
+agree on what a note contains. The HUD's transcribe button goes through the same code
+path when the sheet has already been captured.
 
 ## Where strokes are stored
 

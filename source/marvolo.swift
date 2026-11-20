@@ -598,6 +598,24 @@ func strokesFromDisk() -> (strokes: [[DocPoint]], file: String) {
     return ([], "")
 }
 
+/// Write a transcript into a note folder and record it in meta.json. The HUD's
+/// transcribe and the library's must leave the note in exactly the same shape, so both
+/// go through here instead of each writing its own file.
+func attachTranscript(noteDir: URL, text: String) -> String? {
+    if let e = writeNoteFile(noteDir.appendingPathComponent("page.txt"), Data(text.utf8)) { return e }
+    let metaURL = noteDir.appendingPathComponent("meta.json")
+    if let data = try? Data(contentsOf: metaURL),
+       var meta = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+        meta["text"] = text
+        meta["transcribed"] = ISO8601DateFormatter().string(from: Date())
+        if let out = try? JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted, .sortedKeys]),
+           let e = writeNoteFile(metaURL, out) {
+            return e
+        }
+    }
+    return nil
+}
+
 /// Snapshot the current sheet. The sheet stays open — this is a camera, not a scalpel.
 func capturePage() -> [String: Any] {
     let snap = document.snapshot()
@@ -717,11 +735,31 @@ func transcribePage() -> [String: Any] {
     // If this page was already captured, the transcript lands in that note too.
     var saved = ""
     if let note = lastNote, note.page == snap.page {
-        let url = note.dir.appendingPathComponent("page.txt")
-        if let e = writeNoteFile(url, Data(text.utf8)) { saved = "error: \(e)" } else { saved = url.path }
+        if let e = attachTranscript(noteDir: note.dir, text: text) { saved = "error: \(e)" }
+        else { saved = note.dir.appendingPathComponent("page.txt").path }
     }
     print("transcribe: page \(snap.page + 1), \(text.count) chars in \(ms) ms")
     return ["ok": true, "page": snap.page + 1, "text": text, "ms": ms, "saved": saved]
+}
+
+/// Transcribe a note that already exists, from the library. Same OCR path, but the
+/// image comes off disk and the result is written back into that note.
+func transcribeNote(_ dirName: String) -> [String: Any] {
+    guard let pngURL = noteFile(dirName, "page.png"), let png = try? Data(contentsOf: pngURL) else {
+        return ["ok": false, "error": "that note has no page.png to transcribe"]
+    }
+    let started = Date()
+    let (text, error) = ocrText(png: png)
+    let ms = Int(Date().timeIntervalSince(started) * 1000)
+    guard let text = text else {
+        print("transcribe note \(dirName): \(error ?? "failed")")
+        return ["ok": false, "error": error ?? "OCR failed", "ms": ms]
+    }
+    if let e = attachTranscript(noteDir: pngURL.deletingLastPathComponent(), text: text) {
+        return ["ok": false, "error": "could not write the note: \(e)", "text": text, "ms": ms]
+    }
+    print("transcribe note \(dirName): \(text.count) chars in \(ms) ms")
+    return ["ok": true, "id": dirName, "text": text, "ms": ms]
 }
 
 // ---------------------------------------------------------------- page
@@ -772,6 +810,8 @@ let html = #"""
   #libbar{display:flex;align-items:center;gap:8px;padding:6px 10px;border-bottom:1px solid #e2ded6;
           background:#fff;font-size:11px;color:#6b665e}
   #libbar button{white-space:nowrap}
+  #libmsg{font-size:11px;color:#8a857c}
+  #libmsg.err{color:#8f1f1f}
   #stagewrap{flex:1;position:relative;overflow:hidden;background:#eae6de;cursor:grab;touch-action:none}
   #stagewrap.drag{cursor:grabbing}
   #stage{position:absolute;top:0;left:0;transform-origin:0 0}
@@ -813,7 +853,9 @@ let html = #"""
         <span id="libmeta"></span>
         <span class="spacer"></span>
         <button id="revealbtn" onclick="revealNote()" disabled>open in Finder</button>
+        <button id="trnotebtn" onclick="transcribeNote()" disabled>transcribe</button>
         <button id="copybtn" onclick="copyNoteText()" disabled>copy text</button>
+        <span id="libmsg"></span>
         <button onclick="fitViewer()">fit</button>
       </div>
       <div id="stagewrap"><div id="stage"></div></div>
@@ -990,6 +1032,10 @@ async function selectNote(n){
   document.getElementById('libmeta').textContent = when + ' · p' + (n.page || 1)
     + ' · ' + (n.strokes || 0) + ' trazos · ' + (n.points || 0) + ' puntos';
   document.getElementById('revealbtn').disabled = false;
+  const trnote = document.getElementById('trnotebtn');
+  const libmsg = document.getElementById('libmsg');
+  libmsg.textContent = ''; libmsg.className = '';
+  trnote.disabled = !!n.hasText;      // already transcribed: nothing to do
 
   const stage = document.getElementById('stage');
   if (n.hasSvg) {
@@ -1060,6 +1106,33 @@ function zoomAt(px, py, factor){
 async function revealNote(){
   if (!curNote) return;
   await fetch('/note/reveal?d=' + encodeURIComponent(curNote.id)).catch(() => {});
+}
+
+// Transcribe an old note: the image comes from the note folder, and the text is written
+// back into that same note, so the library and the note on disk never disagree.
+async function transcribeNote(){
+  if (!curNote) return;
+  const btn = document.getElementById('trnotebtn');
+  const msg = document.getElementById('libmsg');
+  btn.disabled = true;
+  msg.className = ''; msg.textContent = 'transcribiendo…';
+  try {
+    const r = await (await fetch('/note/transcribe?d=' + encodeURIComponent(curNote.id))).json();
+    if (!r.ok) {
+      msg.className = 'err'; msg.textContent = r.error || 'falló';
+    } else {
+      const out = document.getElementById('libtext');
+      out.textContent = r.text; out.style.display = 'block';
+      document.getElementById('copybtn').disabled = false;
+      await loadNotes();
+      const fresh = notes.find(n => n.id === curNote.id);
+      if (fresh) curNote = fresh;
+      msg.className = ''; msg.textContent = 'listo · ' + (r.ms / 1000).toFixed(1) + 's';
+    }
+  } catch (e) {
+    msg.className = 'err'; msg.textContent = 'falló: ' + e;
+  }
+  btn.disabled = !!(curNote && curNote.hasText);
 }
 function copyNoteText(){
   const text = document.getElementById('libtext').textContent;
@@ -1357,6 +1430,16 @@ final class Server {
             default: mime = "application/json"
             }
             _ = respondData(fd, mime, data)
+            return
+        }
+
+        if path.hasPrefix("/note/transcribe") {
+            let query = noteQuery(path)
+            guard let dir = query["d"] else {
+                _ = respondJSON(fd, ["ok": false, "error": "missing d (note id)"])
+                return
+            }
+            _ = respondJSON(fd, transcribeNote(dir))
             return
         }
 
