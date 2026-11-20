@@ -88,13 +88,13 @@ Not a lead: `BLY*` classes = Tencent Bugly.
     ./noteble gatt "Note Plus"        connect (app quit), dump tree, read chars
     ./noteble sniff "Note Plus" 45    connect (app quit), subscribe, log
     ./noteble replay <log> 8765 4      replay a capture into the live view (dev aid)
-    ./notelive live [port]            LIVE VIEW: BLE -> SSE -> browser canvas
-    ./notelive replay FILE [port] [x] replay a capture into the live view (dev aid)
+    ./marvolo live [port]            LIVE VIEW: BLE -> SSE -> browser canvas
+    ./marvolo replay FILE [port] [x] replay a capture into the live view (dev aid)
     python3 decode.py <ble-log>.txt   decode to svg/png/json
     python3 decode2.py <log> <out>    decode with hover track (svg/png/json)
     python3 analyze.py <log>          per-magic/type statistics
 
-Live view: run `./notelive live`, open http://127.0.0.1:8765/ . Canvas auto-fits to
+Live view: run `./marvolo live`, open http://127.0.0.1:8765/ . Canvas auto-fits to
 what has been written, draws hover in blue and ink in black with pressure width,
 prints points/strokes/points-per-second, keeps a 40k-event backlog so a late browser
 or a refresh redraws the sheet, and appends every event to live-<ts>.ndjson —

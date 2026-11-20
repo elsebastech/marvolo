@@ -1,4 +1,4 @@
-# NoteLive
+# Marvolo
 
 Reads pen data straight off an **XP-Pen Note Plus** Bluetooth smart notebook
 (`CT860B`, advertises as `Note Plus 2214`) and draws the strokes live in a
@@ -27,37 +27,37 @@ One Swift file, no package dependencies: `swiftc` and the system frameworks.
 
 ## Layout
 
-    source/notelive.swift       the whole program (BLE + HTTP/SSE + HTML/JS page)
-    source/build_app.sh         builds NoteLive.app (universal, ad-hoc signed)
+    source/marvolo.swift       the whole program (BLE + HTTP/SSE + HTML/JS page)
+    source/build_app.sh         builds Marvolo.app (universal, ad-hoc signed)
     source/PROTOCOL-NOTES.md    device protocol notes
     ASSISTANT-HANDOFF.md        full engineering spec — read this first
     README.txt                  end-user quickstart shipped in the distribution
-    NoteLive.app/               built bundle (gitignored)
+    Marvolo.app/               built bundle (gitignored)
 
 ## Build
 
-    cd source && bash build_app.sh && mv NoteLive.app ../
+    cd source && bash build_app.sh && mv Marvolo.app ../
 
 `build_app.sh` builds **into `source/`**; the distribution expects the bundle one
 level up. Forgetting the `mv` silently ships the previous build. Verify:
 
-    strings -a NoteLive.app/Contents/MacOS/NoteLive | grep -c "/status"   # must be >= 1
+    strings -a Marvolo.app/Contents/MacOS/Marvolo | grep -c "/status"   # must be >= 1
 
 ## Run
 
-    ./NoteLive.app/Contents/MacOS/NoteLive        # serves http://127.0.0.1:8765/
-    ./notelive live [port]
-    ./notelive replay capture.txt [port] [speed]  # no hardware needed
+    ./Marvolo.app/Contents/MacOS/Marvolo        # serves http://127.0.0.1:8765/
+    ./marvolo live [port]
+    ./marvolo replay capture.txt [port] [speed]  # no hardware needed
 
 First launch needs Bluetooth permission, and the app is ad-hoc signed, so use
-right-click → Open or `xattr -dr com.apple.quarantine NoteLive.app`.
+right-click → Open or `xattr -dr com.apple.quarantine Marvolo.app`.
 
 ## Where strokes are stored
 
 Captures are **local state, never repository content** — they are the user's
 handwriting. They go to:
 
-    ~/Library/Application Support/NoteLive/captures/session-<epoch>.ndjson
+    ~/Library/Application Support/Marvolo/captures/session-<epoch>.ndjson
 
 One file per run, one JSON event per line:
 
@@ -76,7 +76,7 @@ that bug cost a full session of handwriting.
 
 `source/../` has no test suite; verification is behavioural:
 
-1. `swiftc -O -o /tmp/nl notelive.swift` — zero warnings.
+1. `swiftc -O -o /tmp/nl marvolo.swift` — zero warnings.
 2. Replay a synthetic capture and check the ndjson file fills with the right event types.
 3. Load the page and confirm orientation (letters, not scribbles), backlog on reload, HUD counters.
 4. Against hardware: write, disconnect from the HUD, reconnect, write again.

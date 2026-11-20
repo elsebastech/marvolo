@@ -1,7 +1,7 @@
-// notelive — live ink view for the XP-Pen Note Plus.
+// marvolo — live ink view for the XP-Pen Note Plus.
 //
-//   ./notelive live    [port]          capture over BLE and stream to a browser
-//   ./notelive replay FILE [port] [x]  replay a ble-log file at x speed (default 1.0)
+//   ./marvolo live    [port]          capture over BLE and stream to a browser
+//   ./marvolo replay FILE [port] [x]  replay a ble-log file at x speed (default 1.0)
 //
 // Open http://127.0.0.1:8765/ in a browser. Every stroke and hover sample arrives
 // over Server-Sent Events and is drawn on a canvas. Events are also appended to
@@ -22,7 +22,7 @@ var replayFile: String? = nil
 var replaySpeed: Double = 1.0
 
 if mode == "replay" {
-    guard args.count > 2 else { print("usage: notelive replay FILE [port] [speed]"); exit(1) }
+    guard args.count > 2 else { print("usage: marvolo replay FILE [port] [speed]"); exit(1) }
     replayFile = args[2]
     if args.count > 3, let p = UInt16(args[3]) { port = p }
     if args.count > 4, let s = Double(args[4]) { replaySpeed = s }
@@ -54,7 +54,7 @@ let captureDir: URL = {
     }
     let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
         ?? URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support", isDirectory: true)
-    return base.appendingPathComponent("NoteLive/captures", isDirectory: true)
+    return base.appendingPathComponent("Marvolo/captures", isDirectory: true)
 }()
 
 var captureStatus = "unknown"
@@ -96,7 +96,7 @@ func record(_ json: String) {
 
 let html = #"""
 <!doctype html>
-<html><head><meta charset="utf-8"><title>Note Plus — live ink</title>
+<html><head><meta charset="utf-8"><title>Marvolo — live ink</title>
 <style>
   html,body{margin:0;height:100%;background:#f6f4ef;font:13px -apple-system,system-ui,sans-serif;overflow:hidden}
   canvas{display:block;width:100vw;height:100vh}

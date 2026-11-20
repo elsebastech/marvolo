@@ -1,6 +1,6 @@
 # Build output — never committed
-NoteLive.app/
-source/NoteLive.app/
+Marvolo.app/
+source/Marvolo.app/
 build/
 .build/
 *.o

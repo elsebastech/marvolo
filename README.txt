@@ -1,4 +1,4 @@
-NoteLive — live ink view for the XP-Pen Note Plus
+Marvolo — live ink view for the XP-Pen Note Plus
 ================================================
 
 WHAT IT IS
@@ -8,10 +8,10 @@ WHAT IT IS
   account or cloud service is used.
 
 HOW TO RUN
-  1. Unzip, then drag NoteLive.app to /Applications (or run it from anywhere).
+  1. Unzip, then drag Marvolo.app to /Applications (or run it from anywhere).
   2. First launch: right-click the app -> Open -> Open. macOS will block a
      double-click because the app is signed ad-hoc, not by an Apple developer.
-     (If it still refuses: xattr -dr com.apple.quarantine /Applications/NoteLive.app)
+     (If it still refuses: xattr -dr com.apple.quarantine /Applications/Marvolo.app)
   3. macOS asks for Bluetooth access the first time — approve it. Without this it
      can connect to nothing.
   4. The app opens http://127.0.0.1:8765/ automatically. Open the notebook
@@ -20,12 +20,12 @@ HOW TO RUN
 
 IF IT FINDS NOTHING
   - The notebook sleeps when closed. Open it first.
-  - If NotePlusX is connected on that machine, that is fine — NoteLive attaches to
+  - If NotePlusX is connected on that machine, that is fine — Marvolo attaches to
     the existing link — but the notebook must be awake.
   - The notebook was originally paired with your other Mac. On a machine that has
     never seen it, you may need to put the notebook into pairing mode: hold the
     multifunction button ~3 s until the blue light flashes rapidly, then relaunch
-    NoteLive. Accept any system pairing prompt.
+    Marvolo. Accept any system pairing prompt.
   - A one-page protocol summary is in source/PROTOCOL-NOTES.md if you want to
     write your own client instead.
 
@@ -47,21 +47,21 @@ CONNECT / DISCONNECT
 WHAT IT DOES NOT DO (yet)
   The ~50 pages stored offline inside the notebook still require a device command
   that has not been reverse-engineered. Live capture only covers writing that
-  happens while NoteLive is connected.
+  happens while Marvolo is connected.
 
 REBUILDING / MODIFYING
   ASSISTANT-HANDOFF.md is the technical handoff: full protocol, code map, extension
-  recipes, failure modes and a test checklist. Read that before editing notelive.swift.
+  recipes, failure modes and a test checklist. Read that before editing marvolo.swift.
 
-  source/ contains notelive.swift (single file, no dependencies) and build_app.sh.
+  source/ contains marvolo.swift (single file, no dependencies) and build_app.sh.
   Xcode command line tools are required:  xcode-select --install
-      cd source && ./build_app.sh      # produces NoteLive.app (universal)
+      cd source && ./build_app.sh      # produces Marvolo.app (universal)
 
   Command line use (no bundle):
-      swiftc -O -o notelive notelive.swift
-      ./notelive live              # serve on 8765, no browser auto-launch
-      ./notelive live 9000         # different port
-      ./notelive replay capture.txt 9000 4   # replay a saved ble-log capture
+      swiftc -O -o marvolo marvolo.swift
+      ./marvolo live              # serve on 8765, no browser auto-launch
+      ./marvolo live 9000         # different port
+      ./marvolo replay capture.txt 9000 4   # replay a saved ble-log capture
 
   Every received event is also appended to live-<timestamp>.ndjson in the working
   directory — that file is the input for transcription work.

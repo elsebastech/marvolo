@@ -1,4 +1,9 @@
-# NoteLive — engineering handoff
+# Marvolo — engineering handoff
+
+> Renamed from NoteLive to **Marvolo** on 2026-11-20. Repo, bundle id
+> (`com.elsebastech.marvolo`), capture directory and this note all follow the
+> new name; the protocol facts below are unchanged.
+
 
   
 
@@ -36,9 +41,9 @@ Two binaries come from one source file:
 
   
 
-- `NoteLive.app` — double-clickable, universal (x86_64 + arm64), auto-opens the page.
+- `Marvolo.app` — double-clickable, universal (x86_64 + arm64), auto-opens the page.
 
-- `notelive` — the same thing from a terminal, no auto-open, accepts port/replay args.
+- `marvolo` — the same thing from a terminal, no auto-open, accepts port/replay args.
 
   
 
@@ -218,7 +223,7 @@ process.
 
   
 
-## 4. File map (`notelive.swift`, ~447 lines)
+## 4. File map (`marvolo.swift`, ~447 lines)
 
   
 
@@ -296,19 +301,19 @@ should consume the ndjson stream, not the canvas.
 
 # terminal binary
 
-swiftc -O -o notelive notelive.swift
+swiftc -O -o marvolo marvolo.swift
 
-./notelive live # serve http://127.0.0.1:8765/
+./marvolo live # serve http://127.0.0.1:8765/
 
-./notelive live 9000 # custom port
+./marvolo live 9000 # custom port
 
-./notelive replay ble-log.txt 9000 4 # replay a capture at 4x — no hardware needed
+./marvolo replay ble-log.txt 9000 4 # replay a capture at 4x — no hardware needed
 
   
 
 # app bundle (universal, ad-hoc signed)
 
-./build_app.sh # -> NoteLive.app
+./build_app.sh # -> Marvolo.app
 
 ```
 
@@ -402,7 +407,7 @@ chrome. Changing Swift is only needed for transport or protocol work.
 
 | `clients: 1, events: 0` | Browser fine, device silent | Notebook asleep, or subscribed to the wrong characteristic |
 
-| Double-click refuses to launch | Ad-hoc signed, not notarised | Right-click → Open, or `xattr -dr com.apple.quarantine NoteLive.app` |
+| Double-click refuses to launch | Ad-hoc signed, not notarised | Right-click → Open, or `xattr -dr com.apple.quarantine Marvolo.app` |
 
 | Connects to nothing, no prompt | Bluetooth TCC not granted | System Settings → Privacy & Security → Bluetooth → enable for the app or terminal |
 
@@ -410,7 +415,7 @@ chrome. Changing Swift is only needed for transport or protocol work.
 
 | Process dies when a tab closes | `SIGPIPE` not ignored | Keep `signal(SIGPIPE, SIG_IGN)` |
 
-| `bind failed` on start | Port in use | `./notelive live 9000` |
+| `bind failed` on start | Port in use | `./marvolo live 9000` |
 
   
 
@@ -456,15 +461,15 @@ are known command names in the vendor binary) are not implemented.
 
   
 
-1. `swiftc -O -o notelive notelive.swift` compiles with no errors.
+1. `swiftc -O -o marvolo marvolo.swift` compiles with no errors.
 
-2. `./notelive replay <capture> 8765 4` then load the page: handwriting is readable
+2. `./marvolo replay <capture> 8765 4` then load the page: handwriting is readable
 
 and correctly oriented (not mirrored), hover appears blue, HUD counts rise.
 
 3. Reload the browser mid-replay: the sheet redraws from the backlog.
 
-4. With hardware: cold-start the notebook, `./notelive live`, write — ink arrives
+4. With hardware: cold-start the notebook, `./marvolo live`, write — ink arrives
 
 within a second.
 
@@ -528,7 +533,7 @@ in the same set was kept and still received data.
 
 ### Note on the replay capture format
 
-`notelive replay` only accepts lines that contain the substring `2B10` **and**
+`marvolo replay` only accepts lines that contain the substring `2B10` **and**
 match `^RX ([\d.]+) \S+ len=(\d+) \| (.+)$`. The `2B10` is the characteristic
 id in the address column, e.g.:
 
@@ -617,19 +622,19 @@ sit in `scanning…` forever, because the device no longer advertises itself.
 
 ### Build layout gotcha
 
-`build_app.sh` builds `NoteLive.app` **into its own directory** (`source/`).
+`build_app.sh` builds `Marvolo.app` **into its own directory** (`source/`).
 The shipped layout wants it at the top level of the distribution. So after
 running the script, promote it:
 
 ```bash
-cd source && bash build_app.sh && mv NoteLive.app ../
+cd source && bash build_app.sh && mv Marvolo.app ../
 ```
 
 Skipping that step silently ships the *previous* build — the bundle still runs
 and still works, it just does not have the new endpoints. Verify with:
 
 ```bash
-strings -a NoteLive.app/Contents/MacOS/NoteLive | grep -c "/status"   # must be 1
+strings -a Marvolo.app/Contents/MacOS/Marvolo | grep -c "/status"   # must be 1
 ```
 
 Also note the extracted `build_app.sh` may lose its executable bit when unzipped;
@@ -655,11 +660,11 @@ Fix: capture under Application Support, with the failure surfaced.
 
 ```swift
 let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-let captureDir = base.appendingPathComponent("NoteLive/captures", isDirectory: true)
+let captureDir = base.appendingPathComponent("Marvolo/captures", isDirectory: true)
 // NOTELIVE_CAPTURE_DIR overrides it (tests, or a synced archive)
 ```
 
-    ~/Library/Application Support/NoteLive/captures/session-<epoch>.ndjson
+    ~/Library/Application Support/Marvolo/captures/session-<epoch>.ndjson
 
 Renamed from `live-<ts>.ndjson` to `session-<ts>.ndjson`.
 
@@ -680,7 +685,7 @@ handle, instead of trapping or silently continuing.
 ### Captures are local state, not repository content
 
 They are the user's handwriting. `.gitignore` excludes `captures/` and
-`*.ndjson`; the repo holds source and build script only. The built `NoteLive.app`
+`*.ndjson`; the repo holds source and build script only. The built `Marvolo.app`
 is excluded too (307 KB, rebuilt every time).
 
 ### Recovering a session that was never written
@@ -704,5 +709,5 @@ once the process quits, the history is gone.
   report `writing`.
 - Unwritable dir (`/System/...`): startup prints `CAPTURE ERROR ... Operation not
   permitted` + `CAPTURE DISABLED`, both endpoints report `"capture":"error"`.
-- Default path: creates `~/Library/Application Support/NoteLive/captures/` and the
+- Default path: creates `~/Library/Application Support/Marvolo/captures/` and the
   session file on first run.
