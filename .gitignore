@@ -1,0 +1,20 @@
+# Build output — never committed
+NoteLive.app/
+source/NoteLive.app/
+build/
+.build/
+*.o
+*.dSYM
+
+# Captures are the user's handwriting. Local state, never in the repo.
+captures/
+*.ndjson
+
+# macOS noise
+.DS_Store
+._*
+
+# Editor / tooling
+.vscode/
+.idea/
+.swiftpm/
