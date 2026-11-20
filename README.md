@@ -78,6 +78,12 @@ Capturing does **not** close the page: it is a camera, not a scalpel. Capturing
 twice keeps both snapshots. Transcribing before capturing is fine — the text
 travels with the note.
 
+A sheet is bounded by `clear` only. The notebook's `0xC0` marker is a stroke
+break, not a page turn — it fires mid-writing, so treating it as a page change
+left capture staring at an empty page. If the app has just restarted, capture
+rebuilds the strokes from the newest session file that has ink and says so in
+`meta.json` (`"source": "session-file"`).
+
 Configuration (environment first, then `~/.config/marvolo/env`; see `.env.example`):
 
     DEEPSEEK_API_KEY        OCR key. Without it the transcribe button says so.

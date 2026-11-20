@@ -107,7 +107,7 @@ byte 1 type 0xA0 pen in range, NOT touching -> HOVER, pressure 0
 
 0xA1 pen touching -> INK, pressure valid
 
-0xC0 marker / boundary -> new page or stroke break
+0xC0 marker -> stroke break, NOT a page turn (see §14: 14 markers while writing two lines)
 
 bytes 2-3 X uint16 LE
 
@@ -825,3 +825,32 @@ OCR, which is a different engine and does not share this limitation.
 - `/ctl?action=nonsense`: `ok:false`, link state untouched (still `scanning`).
 - HUD in a real browser: buttons render, capture reports `saved … · local only`,
   transcribe shows the error in red, buttons re-enable in both cases.
+
+### Correction: 0xC0 is a stroke break, not a page turn
+
+The first version of `Document` treated `0xC0` as "new page". Measured against a real
+session it is not: the notebook emitted **14 markers while Sebastian wrote two lines**
+("Punto de partida"), and the last event of the session was a marker — so the "current
+page" was empty and `capture` answered *nothing written on this page yet* while 1,279
+ink points sat one page back.
+
+What the record actually means: `0xC0` closes the stroke being written, exactly like a
+hover does, and the device fires it at boundaries of its own choosing. There is no
+reliable page delimiter in the stream that has been decoded so far.
+
+So a sheet is bounded by **explicit** user action only: `clear` (or `/ctl?action=clear`)
+ends the sheet and increments its number. Everything written since the last clear
+belongs to the current sheet, which is what someone pressing `capture` expects.
+
+### Capture reads the session file when memory is empty
+
+Restarting the app empties the in-memory document while the ndjson keeps everything.
+`capture` and `transcribe` therefore fall back to disk: current session file first, then
+the newest `session-*.ndjson` in the archive that contains ink. The reply and
+`meta.json` say which one was used (`"source": "memory" | "session-file"`), because a
+note that silently comes from an older file would be a lie about its provenance.
+
+`replay/` sessions are excluded from that search — they are test output, not handwriting.
+
+Verified with the real session: `capture` returned `source: session-file`, 20 strokes,
+1,279 points, and the rendered page reads "Punto de partida", upright and legible.

@@ -167,48 +167,62 @@ struct DocPoint { let x: Int; let y: Int; let p: Int }
 
 final class Document {
     private let lock = NSLock()
-    private var pages: [[[DocPoint]]] = [[]]   // page -> stroke -> points
+    private var strokes: [[DocPoint]] = []
     private var cur: [DocPoint] = []
+    private var sheet = 0            // only `clear` starts a new sheet
 
     func ingest(_ type: UInt8, x: Int, y: Int, p: Int) {
         lock.lock(); defer { lock.unlock() }
         switch type {
         case 0xA1:
             cur.append(DocPoint(x: x, y: y, p: p))
-        case 0xA0:                       // hover ends a stroke but not the page
+        case 0xA0, 0xC0:
+            // 0xA0 is hover and 0xC0 is the notebook's marker: BOTH only end the
+            // current stroke. A marker is NOT a page turn — the device emits one at
+            // stroke boundaries (14 of them for two handwritten lines), so treating
+            // it as a page break left the "current page" empty right after writing
+            // and capture answered "nothing written". Sheet changes are explicit:
+            // the user presses clear.
             flushLocked()
-        case 0xC0:                       // marker: end stroke AND start a new page
-            flushLocked()
-            pages.append([])
         default:
             break
         }
     }
 
     private func flushLocked() {
-        if cur.count > 1 { pages[pages.count - 1].append(cur) }
+        if cur.count > 1 { strokes.append(cur) }
         cur = []
     }
 
-    /// Current page and its strokes, including the one still being written.
+    /// Current sheet and its strokes, including the one still being written.
     func snapshot() -> (page: Int, strokes: [[DocPoint]]) {
         lock.lock(); defer { lock.unlock() }
-        var strokes = pages[pages.count - 1]
-        if cur.count > 1 { strokes.append(cur) }
-        return (pages.count - 1, strokes)
+        var out = strokes
+        if cur.count > 1 { out.append(cur) }
+        return (sheet, out)
     }
 
-    var pageCount: Int {
+    var sheetNumber: Int {
         lock.lock(); defer { lock.unlock() }
-        return pages.count
+        return sheet
     }
 
-    /// The browser's `clear` button now clears here too, so the next capture does not
-    /// resurrect strokes the user just wiped off the screen.
+    /// The browser's `clear` button clears here too, and starts the next sheet, so the
+    /// next capture does not resurrect strokes the user just wiped off the screen.
+    /// `clears` also disables the session-file fallback: once the user emptied the
+    /// sheet, reading old ink back off disk would be a bug, not a rescue.
     func clearCurrentPage() {
         lock.lock(); defer { lock.unlock() }
-        pages[pages.count - 1] = []
+        strokes = []
         cur = []
+        sheet += 1
+        clears += 1
+    }
+
+    private var clears = 0
+    var hasCleared: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return clears > 0
     }
 }
 
@@ -432,12 +446,70 @@ func writeNoteFile(_ url: URL, _ data: Data) -> String? {
     catch { return "\(url.lastPathComponent): \(error.localizedDescription)" }
 }
 
-/// Snapshot the current page. The page stays open — this is a camera, not a scalpel.
+/// Rebuild strokes from a session file. The in-memory model is empty after a restart,
+/// and the ndjson is the only thing that outlives the process, so capture checks disk
+/// before telling the user there is nothing to save.
+func strokesFromSession(_ path: String) -> [[DocPoint]] {
+    guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
+    var out: [[DocPoint]] = []
+    var cur: [DocPoint] = []
+    for line in text.split(separator: "\n") {
+        guard let data = line.data(using: .utf8),
+              let ev = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let t = ev["t"] as? String else { continue }
+        if t == "ink" {
+            cur.append(DocPoint(x: (ev["x"] as? NSNumber)?.intValue ?? 0,
+                                y: (ev["y"] as? NSNumber)?.intValue ?? 0,
+                                p: (ev["p"] as? NSNumber)?.intValue ?? 0))
+        } else if t == "hover" || t == "marker" {
+            if cur.count > 1 { out.append(cur) }
+            cur = []
+        }
+    }
+    if cur.count > 1 { out.append(cur) }
+    return out
+}
+
+/// Current session first, then the most recently written session that has ink. Returns
+/// the file it used so the note records where the strokes actually came from.
+func strokesFromDisk() -> (strokes: [[DocPoint]], file: String) {
+    if !capturePath.isEmpty {
+        let s = strokesFromSession(capturePath)
+        if !s.isEmpty { return (s, (capturePath as NSString).lastPathComponent) }
+    }
+    let files = (try? FileManager.default.contentsOfDirectory(
+        at: captureDir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+    let sessions = files
+        .filter { $0.lastPathComponent.hasPrefix("session-") && $0.pathExtension == "ndjson" }
+        .sorted { a, b in
+            let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return da > db
+        }
+    for url in sessions.prefix(5) {
+        let s = strokesFromSession(url.path)
+        if !s.isEmpty { return (s, url.lastPathComponent) }
+    }
+    return ([], "")
+}
+
+/// Snapshot the current sheet. The sheet stays open — this is a camera, not a scalpel.
 func capturePage() -> [String: Any] {
     let snap = document.snapshot()
-    let points = snap.strokes.reduce(0) { $0 + $1.count }
-    guard points > 0, let png = renderPNG(snap.strokes) else {
-        return ["ok": false, "error": "nothing written on this page yet"]
+    var strokes = snap.strokes
+    var source = (capturePath as NSString).lastPathComponent
+    var fromMemory = true
+    if strokes.isEmpty && !document.hasCleared {
+        let disk = strokesFromDisk()
+        strokes = disk.strokes
+        if !disk.file.isEmpty { source = disk.file }
+        fromMemory = false
+    }
+    let points = strokes.reduce(0) { $0 + $1.count }
+    guard points > 0, let png = renderPNG(strokes) else {
+        return ["ok": false, "error": document.hasCleared
+                    ? "this sheet is empty — you cleared it, so there is nothing to capture"
+                    : "no ink yet — nothing has been written"]
     }
 
     let dir = uniqueNoteDir(page: snap.page)
@@ -446,7 +518,7 @@ func capturePage() -> [String: Any] {
 
     var failures: [String] = []
     if let e = writeNoteFile(dir.appendingPathComponent("page.png"), png) { failures.append(e) }
-    let svg = renderSVG(snap.strokes)
+    let svg = renderSVG(strokes)
     if let svg = svg, let e = writeNoteFile(dir.appendingPathComponent("page.svg"), Data(svg.utf8)) {
         failures.append(e)
     }
@@ -463,9 +535,10 @@ func capturePage() -> [String: Any] {
         "app": "marvolo",
         "page": snap.page + 1,
         "captured": ISO8601DateFormatter().string(from: Date()),
-        "strokes": snap.strokes.count,
+        "strokes": strokes.count,
         "points": points,
-        "session": (capturePath as NSString).lastPathComponent,
+        "session": source,
+        "source": fromMemory ? "memory" : "session-file",
         "png": "page.png",
         "svg": svg == nil ? "" : "page.svg",
     ]
@@ -480,8 +553,9 @@ func capturePage() -> [String: Any] {
         "ok": true,
         "page": snap.page + 1,
         "dir": dir.path,
-        "strokes": snap.strokes.count,
+        "strokes": strokes.count,
         "points": points,
+        "source": fromMemory ? "memory" : "session-file",
         "text": textHere ?? "",
     ]
     if !failures.isEmpty { result["writeErrors"] = failures }
@@ -512,14 +586,18 @@ func capturePage() -> [String: Any] {
         result["uploaded"] = false
         result["webhook"] = "MARVOLO_WEBHOOK_URL not set — note kept local"
     }
-    print("capture: page \(snap.page + 1), \(snap.strokes.count) strokes, \(points) points -> \(dir.path)")
+    print("capture: page \(snap.page + 1), \(strokes.count) strokes, \(points) points (\(fromMemory ? "memory" : source)) -> \(dir.path)")
     return result
 }
 
 func transcribePage() -> [String: Any] {
     let snap = document.snapshot()
-    guard let png = renderPNG(snap.strokes) else {
-        return ["ok": false, "error": "nothing written on this page yet"]
+    var strokes = snap.strokes
+    if strokes.isEmpty && !document.hasCleared { strokes = strokesFromDisk().strokes }
+    guard let png = renderPNG(strokes) else {
+        return ["ok": false, "error": document.hasCleared
+                    ? "this sheet is empty — you cleared it, so there is nothing to capture"
+                    : "no ink yet — nothing has been written"]
     }
     let started = Date()
     let (text, error) = ocrText(png: png)
