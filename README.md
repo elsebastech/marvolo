@@ -103,6 +103,26 @@ The app prints what is configured at startup, never the values:
     config: ocr key set -> api.deepseek.com
     config: webhook 127.0.0.1
 
+## Library
+
+The `library` button opens the capture archive full screen: a list on the left
+(thumbnail, date, strokes, points, whether it has text) and the selected note on
+the right. The note is drawn from its **SVG**, not the PNG, so zoom (wheel) and pan
+(drag) stay sharp at any size; `fit` or a double-click re-frames it, `Esc` closes.
+
+    GET /notes            the archive as JSON, newest first
+    GET /note/thumb?d=    cached 360 px thumbnail, generated on first request
+    GET /note/file?d=&f=  page.png | page.svg | page.txt | meta.json
+    GET /note/reveal?d=   reveal the note folder in Finder
+
+Files are addressed by note name, never by path: the server refuses anything outside
+the notes directory and anything that is not one of the four files it wrote itself.
+Thumbnails are cached as `thumb.png` next to each note and regenerated only when the
+page PNG is newer, so a large archive still opens instantly.
+
+Today the note actions are `open in Finder` and `copy text` (enabled only when the
+note has a transcript).
+
 ## Where strokes are stored
 
 Captures are **local state, never repository content** — they are the user's

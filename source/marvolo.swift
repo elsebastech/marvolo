@@ -309,10 +309,13 @@ func renderSVG(_ strokes: [[DocPoint]]) -> String? {
 
     """
     func sx(_ v: Int, _ origin: Double) -> Int { Int((Double(v) - origin).rounded()) }
+    // Width in viewBox units, computed from the same curve the PNG uses at 2400 px, so
+    // the vector and the raster agree instead of the SVG looking like hairlines.
+    let uScale = min(4.0, 2400.0 / max(1.0, f.x1 - f.x0))
     for s in strokes where s.count > 1 {
         for i in 1..<s.count {
             let a = s[i - 1], b = s[i]
-            let wpx = String(format: "%.2f", penWidth((a.p + b.p) / 2, scale: 1.0) / 14.0 * 3.0)
+            let wpx = String(format: "%.2f", penWidth((a.p + b.p) / 2, scale: uScale) / uScale)
             out += "<line x1=\"\(sx(a.x, f.x0))\" y1=\"\(sx(a.y, f.y0))\" x2=\"\(sx(b.x, f.x0))\" "
                  + "y2=\"\(sx(b.y, f.y0))\" stroke-width=\"\(wpx)\"/>\n"
         }
@@ -424,7 +427,9 @@ func noteStamp() -> String {
 
 func notesBaseDir() -> URL {
     if let dir = notesDirEnv { return URL(fileURLWithPath: dir, isDirectory: true) }
-    return captureDir.appendingPathComponent("notes", isDirectory: true)
+    // From the archive root, not the session directory: a replay writes its events under
+    // captures/replay/, but the library must still show the real notes.
+    return baseCaptureDir.appendingPathComponent("notes", isDirectory: true)
 }
 
 /// One folder per capture. Capturing twice keeps both snapshots rather than
@@ -444,6 +449,106 @@ func uniqueNoteDir(page: Int) -> URL {
 func writeNoteFile(_ url: URL, _ data: Data) -> String? {
     do { try data.write(to: url); return nil }
     catch { return "\(url.lastPathComponent): \(error.localizedDescription)" }
+}
+
+// ---------------------------------------------------------------- notes library
+//
+// The archive is plain folders, so the library is a directory listing — no index to
+// keep in sync, and notes captured before this code existed show up too.
+
+func noteQuery(_ path: String) -> [String: String] {
+    guard let mark = path.firstIndex(of: "?") else { return [:] }
+    var out: [String: String] = [:]
+    for pair in path[path.index(after: mark)...].split(separator: "&") {
+        let kv = pair.split(separator: "=", maxSplits: 1)
+        if kv.count == 2 {
+            out[String(kv[0])] = String(kv[1]).removingPercentEncoding ?? String(kv[1])
+        }
+    }
+    return out
+}
+
+func listNotes() -> [[String: Any]] {
+    let root = notesBaseDir()
+    let urls = (try? FileManager.default.contentsOfDirectory(
+        at: root, includingPropertiesForKeys: [.contentModificationDateKey],
+        options: [.skipsHiddenFiles])) ?? []
+    var out: [[String: Any]] = []
+    for dir in urls where dir.hasDirectoryPath {
+        var entry: [String: Any] = ["id": dir.lastPathComponent]
+        if let data = try? Data(contentsOf: dir.appendingPathComponent("meta.json")),
+           let meta = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            for key in ["page", "strokes", "points", "captured", "session", "source"] {
+                entry[key] = meta[key] ?? ""
+            }
+            if let text = meta["text"] as? String, !text.isEmpty { entry["text"] = text }
+        }
+        if (entry["captured"] as? String ?? "").isEmpty {
+            let m = (try? dir.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
+            entry["captured"] = ISO8601DateFormatter().string(from: m)
+        }
+        for (key, file) in [("hasPng", "page.png"), ("hasSvg", "page.svg"), ("hasText", "page.txt")] {
+            entry[key] = FileManager.default.fileExists(atPath: dir.appendingPathComponent(file).path)
+        }
+        out.append(entry)
+    }
+    // Newest first. `captured` is ISO 8601 UTC, so a string sort is chronological.
+    out.sort { (($0["captured"] as? String) ?? "") > (($1["captured"] as? String) ?? "") }
+    return out
+}
+
+/// Only files this app wrote, only inside the notes folder. A local server still does
+/// not get to read `../../../.ssh` because someone typed a query string.
+func noteFile(_ dirName: String, _ fileName: String) -> URL? {
+    let allowed = ["page.png", "page.svg", "page.txt", "meta.json"]
+    let plain = { (s: String) in
+        !s.isEmpty && s.range(of: "^[A-Za-z0-9._-]+$", options: .regularExpression) != nil
+    }
+    guard plain(dirName), allowed.contains(fileName) else { return nil }
+    let root = notesBaseDir().standardizedFileURL
+    let url = root.appendingPathComponent(dirName, isDirectory: true)
+        .appendingPathComponent(fileName).standardizedFileURL
+    guard url.path.hasPrefix(root.path + "/") else { return nil }
+    return FileManager.default.fileExists(atPath: url.path) ? url : nil
+}
+
+func revealInFinder(_ dirName: String) -> Bool {
+    guard noteFile(dirName, "meta.json") != nil else { return false }
+    let dir = notesBaseDir().appendingPathComponent(dirName, isDirectory: true)
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    p.arguments = ["-R", dir.path]
+    do { try p.run(); return true } catch { return false }
+}
+
+/// Cached thumbnail for the library list. Without this the list downloads the full
+/// 150-200 KB page render per note just to show 54×38 px, which turns a 50-note archive
+/// into an 8 MB page. Generated once, stored next to the note, regenerated only if the
+/// page PNG is newer.
+func noteThumbnail(_ dirName: String, maxWidth: Int = 360) -> URL? {
+    guard let page = noteFile(dirName, "page.png") else { return nil }
+    let thumb = page.deletingLastPathComponent().appendingPathComponent("thumb.png")
+    let fm = FileManager.default
+    if fm.fileExists(atPath: thumb.path),
+       let t = (try? thumb.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
+       let p = (try? page.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
+       t >= p {
+        return thumb
+    }
+    guard let src = CGImageSourceCreateWithURL(page as CFURL, nil) else { return nil }
+    let options: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceThumbnailMaxPixelSize: maxWidth,
+    ]
+    guard let image = CGImageSourceCreateThumbnailAtIndex(src, 0, options as CFDictionary) else { return nil }
+    let out = NSMutableData()
+    guard let dest = CGImageDestinationCreateWithData(out, UTType.png.identifier as CFString, 1, nil)
+    else { return nil }
+    CGImageDestinationAddImage(dest, image, nil)
+    guard CGImageDestinationFinalize(dest) else { return nil }
+    try? (out as Data).write(to: thumb)
+    return fm.fileExists(atPath: thumb.path) ? thumb : nil
 }
 
 /// Rebuild strokes from a session file. The in-memory model is empty after a restart,
@@ -648,6 +753,32 @@ let html = #"""
   #panelhead{display:flex;align-items:center;gap:6px;margin-bottom:4px;color:#666}
   #panelhead button{margin-left:auto}
   #out{margin:0;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;color:#15120f}
+
+  /* library: full screen, because browsing captures is a different task from writing */
+  #library{position:fixed;inset:0;background:#f6f4ef;display:none;flex-direction:column;z-index:20}
+  #library.open{display:flex}
+  #libhead{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid #e2ded6;background:#fff}
+  #libhead b{font-size:13px}
+  #libcount{font-size:11px;color:#8a857c}
+  #libbody{flex:1;display:flex;min-height:0}
+  #liblist{width:286px;overflow:auto;border-right:1px solid #e2ded6;background:#fff}
+  .noteitem{padding:8px 10px;border-bottom:1px solid #f0ece4;cursor:pointer;display:flex;gap:9px;align-items:center}
+  .noteitem:hover{background:#faf8f3}
+  .noteitem.sel{background:#eef3fb}
+  .noteitem img{width:54px;height:38px;object-fit:contain;border:1px solid #e6e2da;border-radius:3px;background:#fff}
+  .noteitem .t{font-size:12px;color:#333}
+  .noteitem .s{font-size:10.5px;color:#8a857c}
+  #libside{flex:1;display:flex;flex-direction:column;min-width:0}
+  #libbar{display:flex;align-items:center;gap:8px;padding:6px 10px;border-bottom:1px solid #e2ded6;
+          background:#fff;font-size:11px;color:#6b665e}
+  #libbar button{white-space:nowrap}
+  #stagewrap{flex:1;position:relative;overflow:hidden;background:#eae6de;cursor:grab;touch-action:none}
+  #stagewrap.drag{cursor:grabbing}
+  #stage{position:absolute;top:0;left:0;transform-origin:0 0}
+  #stage svg{display:block;background:#fff;box-shadow:0 2px 10px rgba(0,0,0,.12)}
+  #libtext{max-height:26vh;overflow:auto;border-top:1px solid #e2ded6;background:#fff;padding:8px 12px;
+           font:12px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;color:#15120f;display:none}
+  .spacer{flex:1}
 </style></head>
 <body><canvas id="c"></canvas>
 <div id="hud">
@@ -656,6 +787,7 @@ let html = #"""
   <button id="linkbtn" onclick="toggleLink()">disconnect</button>
   <button id="capbtn" onclick="doCapture()">capture</button>
   <button id="trbtn" onclick="doTranscribe()">transcribe</button>
+  <button id="libbtn" onclick="openLibrary()">library</button>
   <button onclick="clearAll()">clear</button>
   <div>points <b id="pts">0</b> &nbsp; strokes <b id="strokes">0</b> &nbsp; <b id="rate">0</b>/s
        &nbsp;·&nbsp; <span id="cap">checking save…</span></div>
@@ -664,6 +796,29 @@ let html = #"""
     <div id="panelhead"><b id="eng"></b><button onclick="copyText()">copy</button>
       <button onclick="hidePanel()">×</button></div>
     <pre id="out"></pre>
+  </div>
+</div>
+
+<div id="library">
+  <div id="libhead">
+    <b>captures</b> <span id="libcount"></span>
+    <span class="spacer"></span>
+    <button onclick="loadNotes()">refresh</button>
+    <button onclick="closeLibrary()">close</button>
+  </div>
+  <div id="libbody">
+    <div id="liblist"></div>
+    <div id="libside">
+      <div id="libbar">
+        <span id="libmeta"></span>
+        <span class="spacer"></span>
+        <button id="revealbtn" onclick="revealNote()" disabled>open in Finder</button>
+        <button id="copybtn" onclick="copyNoteText()" disabled>copy text</button>
+        <button onclick="fitViewer()">fit</button>
+      </div>
+      <div id="stagewrap"><div id="stage"></div></div>
+      <div id="libtext"></div>
+    </div>
   </div>
 </div>
 <script>
@@ -757,6 +912,7 @@ async function doCapture(){
     else {
       const name = (r.dir || '').split('/').pop();
       say('saved ' + name + (r.uploaded ? ' · sent' : ' · local only'));
+      if (document.getElementById('library').classList.contains('open')) loadNotes();
     }
   } catch (e) { say('capture failed: ' + e, true); }
   b.disabled = false;
@@ -782,6 +938,161 @@ function copyText(){
   navigator.clipboard.writeText(lastText).then(() => say('copied')).catch(() => say('copy failed', true));
 }
 function hidePanel(){ document.getElementById('panel').style.display = 'none'; }
+
+// ---------------------------------------------------------------- library
+//
+// The archive is a folder of folders, so this is a listing plus a viewer. A note is
+// shown from its SVG, not its PNG: zooming a vector stays sharp at any size.
+let notes = [], curNote = null, vx = 0, vy = 0, vs = 1;
+
+async function openLibrary(){
+  document.getElementById('library').classList.add('open');
+  await loadNotes();
+}
+function closeLibrary(){ document.getElementById('library').classList.remove('open'); }
+
+async function loadNotes(){
+  const count = document.getElementById('libcount');
+  try {
+    const r = await (await fetch('/notes')).json();
+    notes = r.notes || [];
+    count.textContent = notes.length ? notes.length + (notes.length === 1 ? ' note' : ' notes') : 'empty';
+    const list = document.getElementById('liblist');
+    list.innerHTML = '';
+    notes.forEach(n => {
+      const el = document.createElement('div');
+      el.className = 'noteitem' + (curNote && curNote.id === n.id ? ' sel' : '');
+      const when = (n.captured || '').replace('T', ' ').replace('Z', '').slice(0, 16);
+      const img = document.createElement('img');
+      img.loading = 'lazy';
+      img.src = '/note/thumb?d=' + encodeURIComponent(n.id);
+      const box = document.createElement('div');
+      const t = document.createElement('div'); t.className = 't'; t.textContent = when;
+      const s = document.createElement('div'); s.className = 's';
+      s.textContent = (n.strokes || 0) + ' trazos · ' + (n.points || 0) + ' puntos' + (n.hasText ? ' · texto' : '');
+      box.appendChild(t); box.appendChild(s);
+      el.appendChild(img); el.appendChild(box);
+      el.onclick = () => selectNote(n);
+      list.appendChild(el);
+    });
+    if (notes.length && !notes.some(n => curNote && n.id === curNote.id)) selectNote(notes[0]);
+  } catch (e) {
+    count.textContent = 'error: ' + e;
+  }
+}
+
+async function selectNote(n){
+  curNote = n;
+  [...document.querySelectorAll('.noteitem')].forEach((el, i) => {
+    el.classList.toggle('sel', !!(notes[i] && notes[i].id === n.id));
+  });
+  const when = (n.captured || '').replace('T', ' ').replace('Z', '').slice(0, 19);
+  document.getElementById('libmeta').textContent = when + ' · p' + (n.page || 1)
+    + ' · ' + (n.strokes || 0) + ' trazos · ' + (n.points || 0) + ' puntos';
+  document.getElementById('revealbtn').disabled = false;
+
+  const stage = document.getElementById('stage');
+  if (n.hasSvg) {
+    const svg = await (await fetch('/note/file?d=' + encodeURIComponent(n.id) + '&f=page.svg')).text();
+    stage.innerHTML = svg;                       // our own output, not foreign markup
+  } else {
+    stage.innerHTML = '';
+    const img = document.createElement('img');
+    img.src = '/note/file?d=' + encodeURIComponent(n.id) + '&f=page.png';
+    stage.appendChild(img);
+  }
+  fitViewer();
+
+  const out = document.getElementById('libtext');
+  const copy = document.getElementById('copybtn');
+  if (n.hasText) {
+    out.textContent = await (await fetch('/note/file?d=' + encodeURIComponent(n.id) + '&f=page.txt')).text();
+    out.style.display = 'block';
+    copy.disabled = false;
+  } else {
+    out.textContent = ''; out.style.display = 'none';
+    copy.disabled = true;
+  }
+}
+
+function applyView(){
+  clampView();
+  document.getElementById('stage').style.transform =
+    'translate(' + vx + 'px,' + vy + 'px) scale(' + vs + ')';
+}
+
+// Keep at least a corner of the sheet reachable. Without this, a fast wheel gesture
+// anchored on blank paper can send the note off screen with nothing to grab.
+function clampView(){
+  const wrap = document.getElementById('stagewrap');
+  const svg = document.querySelector('#stage svg');
+  const img = document.querySelector('#stage img');
+  if (!svg && !img) return;
+  const w = (svg ? (svg.viewBox.baseVal.width || 1000) : (img.naturalWidth || 1000)) * vs;
+  const h = (svg ? (svg.viewBox.baseVal.height || 700) : (img.naturalHeight || 700)) * vs;
+  const keep = 90;
+  vx = Math.min(wrap.clientWidth - keep, Math.max(keep - w, vx));
+  vy = Math.min(wrap.clientHeight - keep, Math.max(keep - h, vy));
+}
+
+function fitViewer(){
+  const wrap = document.getElementById('stagewrap');
+  const svg = document.querySelector('#stage svg');
+  const img = document.querySelector('#stage img');
+  if (!svg && !img) return;
+  const w = svg ? (svg.viewBox.baseVal.width || 1000) : (img.naturalWidth || 1000);
+  const h = svg ? (svg.viewBox.baseVal.height || 700) : (img.naturalHeight || 700);
+  const pad = 28;
+  vs = Math.max(0.02, Math.min((wrap.clientWidth - pad) / w, (wrap.clientHeight - pad) / h));
+  vx = (wrap.clientWidth - w * vs) / 2;
+  vy = (wrap.clientHeight - h * vs) / 2;
+  applyView();
+}
+
+function zoomAt(px, py, factor){
+  const ns = Math.max(0.02, Math.min(16, vs * factor));
+  vx = px - (px - vx) * (ns / vs);
+  vy = py - (py - vy) * (ns / vs);
+  vs = ns;
+  applyView();
+}
+
+async function revealNote(){
+  if (!curNote) return;
+  await fetch('/note/reveal?d=' + encodeURIComponent(curNote.id)).catch(() => {});
+}
+function copyNoteText(){
+  const text = document.getElementById('libtext').textContent;
+  if (text) navigator.clipboard.writeText(text).catch(() => {});
+}
+
+{
+  const wrap = document.getElementById('stagewrap');
+  wrap.addEventListener('wheel', ev => {
+    if (!document.getElementById('library').classList.contains('open')) return;
+    ev.preventDefault();
+    const r = wrap.getBoundingClientRect();
+    zoomAt(ev.clientX - r.left, ev.clientY - r.top, Math.exp(-ev.deltaY * 0.0015));
+  }, {passive: false});
+  let drag = null;
+  wrap.addEventListener('pointerdown', ev => {
+    drag = {x: ev.clientX, y: ev.clientY, vx: vx, vy: vy};
+    wrap.classList.add('drag');
+    wrap.setPointerCapture(ev.pointerId);
+  });
+  wrap.addEventListener('pointermove', ev => {
+    if (!drag) return;
+    vx = drag.vx + (ev.clientX - drag.x);
+    vy = drag.vy + (ev.clientY - drag.y);
+    applyView();
+  });
+  wrap.addEventListener('pointerup', () => { drag = null; wrap.classList.remove('drag'); });
+  wrap.addEventListener('pointercancel', () => { drag = null; wrap.classList.remove('drag'); });
+  wrap.addEventListener('dblclick', fitViewer);
+  window.addEventListener('keydown', ev => {
+    if (ev.key === 'Escape') closeLibrary();
+  });
+}
 let linkEnabled = true, linkBusy = false;
 
 function applyStatus(m){
@@ -1012,6 +1323,49 @@ final class Server {
             return
         }
 
+        // The library is a directory listing of the notes folder, plus the files
+        // themselves. Files are addressed by name and validated by noteFile(), never by
+        // a path from the query string.
+        if path.hasPrefix("/notes") {
+            _ = respondJSON(fd, ["ok": true, "root": notesBaseDir().path, "notes": listNotes()])
+            return
+        }
+
+        if path.hasPrefix("/note/thumb") {
+            let query = noteQuery(path)
+            guard let dir = query["d"], let url = noteThumbnail(dir),
+                  let data = try? Data(contentsOf: url) else {
+                _ = respondJSON(fd, ["ok": false, "error": "no thumbnail"])
+                return
+            }
+            _ = respondData(fd, "image/png", data)
+            return
+        }
+
+        if path.hasPrefix("/note/file") {
+            let query = noteQuery(path)
+            guard let dir = query["d"], let file = query["f"],
+                  let url = noteFile(dir, file), let data = try? Data(contentsOf: url) else {
+                _ = respondJSON(fd, ["ok": false, "error": "no such note file"])
+                return
+            }
+            let mime: String
+            switch url.pathExtension {
+            case "png": mime = "image/png"
+            case "svg": mime = "image/svg+xml"
+            case "txt": mime = "text/plain; charset=utf-8"
+            default: mime = "application/json"
+            }
+            _ = respondData(fd, mime, data)
+            return
+        }
+
+        if path.hasPrefix("/note/reveal") {
+            let query = noteQuery(path)
+            _ = respondJSON(fd, ["ok": query["d"].map { revealInFinder($0) } ?? false])
+            return
+        }
+
         if path.hasPrefix("/stats") {
             let s = "{\"clients\":\(stats.clients),\"events\":\(stats.events)"
                   + ",\"capture\":\"\(captureStatus)\""
@@ -1039,6 +1393,17 @@ final class Server {
         head += "Content-Length: \(body.count)\r\nConnection: close\r\n\r\n"
         _ = sendAll(fd, Array(head.utf8))
         _ = sendAll(fd, [UInt8](body))
+        close(fd)
+        return true
+    }
+
+    /// Same, for bytes: note images, SVGs and text files come through here.
+    @discardableResult
+    private func respondData(_ fd: Int32, _ contentType: String, _ data: Data) -> Bool {
+        var head = "HTTP/1.1 200 OK\r\nContent-Type: \(contentType)\r\nCache-Control: no-store\r\n"
+        head += "Content-Length: \(data.count)\r\nConnection: close\r\n\r\n"
+        _ = sendAll(fd, Array(head.utf8))
+        _ = sendAll(fd, [UInt8](data))
         close(fd)
         return true
     }

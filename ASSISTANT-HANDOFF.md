@@ -861,3 +861,62 @@ the previous session file, never rewritten, but they are not part of the new she
 that matters for a workflow, seed the document at startup instead of lazily; the
 reason it is not done today is that seeding would resurrect yesterday's note for
 someone starting a clean sheet.
+
+---
+
+## 15. The capture library (UI, 2026-11-20)
+
+Full-screen browser over the notes folder: list on the left, selected note on the
+right. No database and no index — the archive is a directory of folders, so the
+library is a listing, and notes captured before this code existed appear in it.
+
+### Endpoints
+
+    GET /notes            { ok, root, notes: [{id, page, strokes, points, captured,
+                                                session, source, hasPng, hasSvg, hasText}] }
+    GET /note/thumb?d=    cached 360 px PNG, generated on first request
+    GET /note/file?d=&f=  page.png | page.svg | page.txt | meta.json
+    GET /note/reveal?d=   /usr/bin/open -R on the note folder
+
+`/notes` sorts by the `captured` field (ISO 8601 UTC, so string order is time order)
+and falls back to the folder mtime when a `meta.json` is missing or lacks it.
+
+### Traps hit while building it
+
+1. **The library must read the archive root, not the session directory.** In replay
+   mode `captureDir` is `captures/replay/`, so deriving the notes path from it made the
+   library show an empty list (it was listing `captures/replay/notes`). `notesBaseDir()`
+   now hangs off `baseCaptureDir`, which is why a replay instance can browse the real
+   archive — useful for UI work without hardware.
+2. **Serve files by name, never by path.** `noteFile()` accepts only the four known
+   file names and a directory name matching `^[A-Za-z0-9._-]+$`, then re-checks the
+   resolved path is inside the notes root. Verified: `d=../../../../etc&f=passwd` and
+   `f=../../Marvolo.app/Contents/Info.plist` both return `no such note file`.
+3. **The list must not download full pages.** Five notes × 170 KB is ~850 KB just to
+   show 54×38 px; fifty notes would be 8 MB per open. `thumb.png` (360 px, ~15 KB) is
+   generated with `CGImageSourceCreateThumbnailAtIndex`, cached in the note folder, and
+   regenerated only when `page.png` is newer than it. First request 38 ms, cached 0.5 ms.
+4. **Zoom must not lose the sheet.** Zoom anchors on the pointer, so a fast wheel on
+   blank paper sends the note off screen with nothing left to grab. `clampView()` keeps
+   at least 90 px of the sheet inside the viewport on every transform.
+5. **SVG stroke width has to match the PNG.** The first version wrote a fixed
+   `stroke-width` and the notation looked like hairlines compared with the render. Width
+   is now `penWidth(pressure, scale: uScale) / uScale` with `uScale = 2400 / frameWidth`,
+   i.e. the same curve the raster uses, expressed in viewBox units.
+
+### What the note view deliberately is not
+
+The note is displayed as the SVG that was written at capture time, so it cannot drift
+from what the note contains. Re-rendering from the ndjson would show a sheet that is
+still growing, which is the live canvas's job. If a note ever needs editing, that is a
+different feature with different rules about which file becomes the truth.
+
+### Verified
+
+- `/notes` on the real archive: 5 notes with metadata, newest first.
+- `/note/file` serves `page.svg` (200, `image/svg+xml`, 134 KB) and `page.png`.
+- Path traversal and unknown file names rejected with `no such note file`.
+- Browser: list renders with thumbnails, selecting a note injects its SVG
+  (`15020×12203`, 1,966 line elements), wheel zoom changes the transform
+  (0.0244 → 0.1646 → 2.27), `fit` restores the framed view, `Esc` closes.
+- Thumbnails: 360×292 / 360×157 / 360×49 depending on the note's aspect, ~9–15 KB each.
