@@ -5,7 +5,8 @@
 //
 // Open http://127.0.0.1:8765/ in a browser. Every stroke and hover sample arrives
 // over Server-Sent Events and is drawn on a canvas. Events are also appended to
-// live-<timestamp>.ndjson next to this binary, which is the feed for transcription.
+// session-<epoch>.ndjson under ~/Library/Application Support/Marvolo/captures/,
+// which is the feed for transcription (NOTELIVE_CAPTURE_DIR overrides the dir).
 import Foundation
 import CoreBluetooth
 import Darwin
@@ -47,15 +48,22 @@ func jsonEscape(_ s: String) -> String {
      .replacingOccurrences(of: "\"", with: "\\\"")
 }
 
-let captureDir: URL = {
+let captureEnv = ProcessInfo.processInfo.environment["NOTELIVE_CAPTURE_DIR"] ?? ""
+let baseCaptureDir: URL = {
     // Escape hatch for tests and for pointing the archive at a synced folder.
-    if let override = ProcessInfo.processInfo.environment["NOTELIVE_CAPTURE_DIR"], !override.isEmpty {
-        return URL(fileURLWithPath: override, isDirectory: true)
-    }
+    if !captureEnv.isEmpty { return URL(fileURLWithPath: captureEnv, isDirectory: true) }
     let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
         ?? URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support", isDirectory: true)
     return base.appendingPathComponent("Marvolo/captures", isDirectory: true)
 }()
+
+// A replay is a test run (or a ble-log -> ndjson conversion), not a writing
+// session. Keep it out of the handwriting archive — under captures/replay/ —
+// unless the caller named a directory explicitly.
+let replayCapture = isReplay && captureEnv.isEmpty
+let captureDir = replayCapture
+    ? baseCaptureDir.appendingPathComponent("replay", isDirectory: true)
+    : baseCaptureDir
 
 var captureStatus = "unknown"
 var capturePath = ""
@@ -63,7 +71,7 @@ var ndjson: FileHandle? = nil
 
 do {
     try FileManager.default.createDirectory(at: captureDir, withIntermediateDirectories: true)
-    let name = "session-\(Int(Date().timeIntervalSince1970)).ndjson"
+    let name = "\(replayCapture ? "replay" : "session")-\(Int(Date().timeIntervalSince1970)).ndjson"
     capturePath = captureDir.appendingPathComponent(name).path
     if !FileManager.default.fileExists(atPath: capturePath) {
         FileManager.default.createFile(atPath: capturePath, contents: nil)
@@ -125,7 +133,10 @@ let html = #"""
        &nbsp;·&nbsp; <span id="cap">checking save…</span></div>
 </div>
 <script>
-const LW = 28800, LH = 36400;          // device active area, Y grows upward
+const LW = 28800, LH = 36400;          // nominal active area only; Y grows DOWNWARD (origin top-left)
+// LW/LH are the fallback frame used when there is nothing worth fitting. Do not
+// treat LH as a clip: real ink has been measured to Y=39043 and view() frames
+// whatever was actually written, so a point past LH is drawn, not lost.
 const cv = document.getElementById('c'), ctx = cv.getContext('2d');
 let sc = 1, ox = 0, oy = 0;
 let strokes = [], cur = [], hovers = [], pts = 0, marks = 0;
@@ -473,7 +484,9 @@ var linkControl: ((String) -> Void)?
 var linkStatusJSON: String?
 
 let server = Server(port: port)
-server.start()
+// Deliberately NOT started here: each mode starts it only once its input is known
+// to be good, so a bad capture (or a taken port) fails before "serving on …" is
+// printed. A process that announces a URL and then exits is a confusing lie.
 
 // Periodically drop clients that disconnected without us noticing.
 Thread.detachNewThread {
@@ -509,22 +522,44 @@ func consume(_ data: Data) {
 // ---------------------------------------------------------------- replay mode
 
 if mode == "replay", let file = replayFile {
-    let text = (try? String(contentsOfFile: file, encoding: .utf8)) ?? ""
+    guard let text = try? String(contentsOfFile: file, encoding: .utf8) else {
+        print("replay: cannot read \(file)"); exit(1)
+    }
     let rx = try! NSRegularExpression(pattern: "^RX ([\\d.]+) \\S+ len=(\\d+) \\| (.+)$")
     var items: [(Double, Data)] = []
+    var skipped = 0, addressed = 0
     for line in text.split(separator: "\n") {
         let s = String(line)
         guard s.contains("2B10") else { continue }
+        addressed += 1
         let ns = s as NSString
-        guard let m = rx.firstMatch(in: s, range: NSRange(location: 0, length: ns.length)) else { continue }
+        guard let m = rx.firstMatch(in: s, range: NSRange(location: 0, length: ns.length)) else {
+            skipped += 1; continue
+        }
         let t = Double(ns.substring(with: m.range(at: 1))) ?? 0
         let hex = ns.substring(with: m.range(at: 3))
         var bytes: [UInt8] = []
         for tok in hex.split(separator: " ") {
             if let v = UInt8(tok, radix: 16) { bytes.append(v) }
         }
-        if bytes.count >= 8 { items.append((t, Data(bytes))) }
+        if bytes.count >= 8 { items.append((t, Data(bytes))) } else { skipped += 1 }
     }
+    // A capture that decodes to nothing must fail here, not open a convincing
+    // empty page. Wrong file, wrong address column, or a truncated export all
+    // land in this branch.
+    if items.isEmpty {
+        print("replay: no decodable 2B10 packets in \(file)")
+        if addressed == 0 {
+            print("replay: no line contains \"2B10\" in the address column — this is")
+            print("        probably not a ble-log capture (ndjson sessions are not).")
+        } else {
+            print("replay: \(addressed) 2B10 line(s) found but none matched the expected shape:")
+        }
+        print("        RX 1000.000 2B10 len=8 | 04 A0 E8 03 E8 03 00 00")
+        print("replay: refusing to serve an empty page"); exit(1)
+    }
+    if skipped > 0 { print("replay: skipped \(skipped) unparsable 2B10 line(s)") }
+    server.start()
     print("replaying \(items.count) packets at \(replaySpeed)x — open http://127.0.0.1:\(port)/")
     let t0 = items.first?.0 ?? 0
     DispatchQueue.global().async {
@@ -754,6 +789,7 @@ final class Live: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 }
 
 let live = Live(target: "Note Plus")
+server.start()
 linkControl = { action in
     if action == "connect" { live.connect() } else { live.disconnect() }
 }
